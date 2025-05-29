@@ -1126,22 +1126,26 @@ class ChainedOptimizer(MegatronOptimizer):
         if found_inf_flag:
             return False, None, None
 
-        grad_norm = self.get_grad_norm()
+        if not self.config.memory_tracing:
+            grad_norm = self.get_grad_norm()
 
-        # Clip gradients.
-        for optimizer in self.chained_optimizers:
-            if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
-                continue
-            if optimizer.config.clip_grad > 0.0:
-                clip_grad_by_total_norm_fp32(
-                    optimizer.get_parameters(),
-                    max_norm=optimizer.config.clip_grad,
-                    total_norm=grad_norm,
-                    use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
-                )
+            # Clip gradients.
+            for optimizer in self.chained_optimizers:
+                if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
+                    continue
+                if optimizer.config.clip_grad > 0.0:
+                    clip_grad_by_total_norm_fp32(
+                        optimizer.get_parameters(),
+                        max_norm=optimizer.config.clip_grad,
+                        total_norm=grad_norm,
+                        use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
+                    )
 
-        # Count the zeros in the grads.
-        num_zeros_in_grad = self.count_zeros()
+            # Count the zeros in the grads.
+            num_zeros_in_grad = self.count_zeros()
+        else:
+            grad_norm = None
+            num_zeros_in_grad = None
 
         update_successful = self.step_with_ready_grads()
 
