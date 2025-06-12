@@ -26,6 +26,13 @@ from megatron.core.utils import (
 # Types
 Shape = Union[List[int], torch.Size]
 
+ENABLE_PP_TIMER = False
+
+
+def set_enable_pp_timer(enable: bool):
+    global ENABLE_PP_TIMER
+    ENABLE_PP_TIMER = enable
+
 
 def get_forward_backward_func():
     """Retrieves the appropriate forward_backward function given the
@@ -717,6 +724,25 @@ def forward_backward_pipelining_with_interleaving(
     # model_chunk_id in [0, num_model_chunks)
     # virtual_microbatch_id in [0, total_num_microbatches)
 
+    start_event = torch.cuda.Event(enable_timing=True)
+    num_model_chunks = len(model)
+    event_pool = {}
+    for i in range(num_model_chunks):
+        for j in range(num_microbatches):
+            event_pool[f'forward-{i}-{j}-start'] = torch.cuda.Event(enable_timing=True)
+            event_pool[f'forward-{i}-{j}-end'] = torch.cuda.Event(enable_timing=True)
+            event_pool[f'backward-{i}-{j}-start'] = torch.cuda.Event(enable_timing=True)
+            event_pool[f'backward-{i}-{j}-end'] = torch.cuda.Event(enable_timing=True)
+
+    cur_stage_microbatch_id = {}
+    for i in range(0, num_model_chunks):
+        cur_stage_microbatch_id[f"fwd-{i}"] = 0
+        cur_stage_microbatch_id[f"bwd-{i}"] = 0
+
+    if ENABLE_PP_TIMER:
+        torch.distributed.barrier()
+        start_event.record()
+
     assert isinstance(model, list), "interleaved pipeline parallelism expected model chunking"
     assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
     assert isinstance(
@@ -1176,7 +1202,12 @@ def forward_backward_pipelining_with_interleaving(
             checkpoint_activations_microbatch = None
 
         microbatch_id = get_microbatch_id_in_model_chunk(k, forward=True)
+
+        cur_micro_batch_id = cur_stage_microbatch_id[f"fwd-{cur_model_chunk_id}"]
+        event_pool[f'forward-{cur_model_chunk_id}-{cur_micro_batch_id}-start'].record()
         output_tensor = forward_step_helper(k, microbatch_id, checkpoint_activations_microbatch)
+        event_pool[f'forward-{cur_model_chunk_id}-{cur_micro_batch_id}-end'].record()
+        cur_stage_microbatch_id[f"fwd-{cur_model_chunk_id}"] += 1
 
         # Don't send tensor downstream if on last stage.
         if is_vp_last_stage(vp_stage=cur_model_chunk_id):
@@ -1317,9 +1348,13 @@ def forward_backward_pipelining_with_interleaving(
 
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
+            cur_micro_batch_id = cur_stage_microbatch_id[f"fwd-{cur_model_chunk_id}"]
+            event_pool[f'forward-{cur_model_chunk_id}-{cur_micro_batch_id}-start'].record()
             output_tensor = forward_step_helper(
                 forward_k, microbatch_id, checkpoint_activations_microbatch
             )
+            event_pool[f'forward-{cur_model_chunk_id}-{cur_micro_batch_id}-end'].record()
+            cur_stage_microbatch_id[f"fwd-{cur_model_chunk_id}"] += 1
 
             # Determine if current stage has anything to send in either direction,
             # otherwise set tensor to None.
@@ -1375,7 +1410,11 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next_wait_handle = recv_next_wait_handles.pop(0)
                         recv_next_wait_handle.wait()
 
+            cur_micro_batch_id = cur_stage_microbatch_id[f"bwd-{backward_model_chunk_id}"]
+            event_pool[f'backward-{backward_model_chunk_id}-{cur_micro_batch_id}-start'].record()
             input_tensor_grad = backward_step_helper(backward_k)
+            event_pool[f'backward-{backward_model_chunk_id}-{cur_micro_batch_id}-end'].record()
+            cur_stage_microbatch_id[f"bwd-{backward_model_chunk_id}"] += 1
 
             # First virtual stage no activation gradient tensor to send.
             if is_vp_first_stage(vp_stage=backward_model_chunk_id):
@@ -1528,7 +1567,11 @@ def forward_backward_pipelining_with_interleaving(
                 if bwd_wait_recv_handles:
                     recv_next_wait_handles.append(bwd_wait_recv_handles.pop("recv_next"))
 
+            cur_micro_batch_id = cur_stage_microbatch_id[f"bwd-{cur_model_chunk_id}"]
+            event_pool[f'backward-{cur_model_chunk_id}-{cur_micro_batch_id}-start'].record()
             input_tensor_grad = backward_step_helper(k)
+            event_pool[f'backward-{cur_model_chunk_id}-{cur_micro_batch_id}-end'].record()
+            cur_stage_microbatch_id[f"bwd-{cur_model_chunk_id}"] += 1
 
             # First virtual stage no activation gradient tensor to send.
             if is_vp_first_stage(vp_stage=cur_model_chunk_id):
@@ -1621,6 +1664,37 @@ def forward_backward_pipelining_with_interleaving(
     if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
+
+    # Record end event
+    if ENABLE_PP_TIMER:
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+
+        torch.cuda.synchronize()
+
+        # Calculate elapsed time for each event compared to start event
+        event_times = {}
+        for event_name, event in event_pool.items():
+            event_times[event_name] = start_event.elapsed_time(event)
+
+        # Add total execution time
+        event_times['total-execution-time'] = start_event.elapsed_time(end_event)
+        rank = torch.distributed.get_rank()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        TPxCPxDP_rank = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        ).rank()
+        import json
+        import os
+        PP_size = parallel_state.get_pipeline_model_parallel_world_size()
+        VPP_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        log_dir = os.environ.get('PP_TIMIER_LOG_DIR', './pp_timer_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        with open(
+            f'{log_dir}/event_times_PP{PP_size}_VPP{VPP_size}_TPxCPxDP_rank_{TPxCPxDP_rank}_pp_rank_{pp_rank}_rank_{rank}.json',
+            'w',
+        ) as f:
+            json.dump(event_times, f)
 
     return forward_data_store
 
@@ -1765,7 +1839,26 @@ def forward_backward_pipelining_without_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
-    stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
+    stages.
+
+    Returns:
+        tuple: A tuple containing two elements:
+            - forward_data_store: Dictionary with losses if the last stage, empty dict otherwise.
+            - event_times: Dictionary with timing measurements for each microbatch and operation.
+    """
+
+    start_event = torch.cuda.Event(enable_timing=True)
+
+    event_pool = {}
+    for i in range(num_microbatches):
+        event_pool[f'forward-{i}-start'] = torch.cuda.Event(enable_timing=True)
+        event_pool[f'forward-{i}-end'] = torch.cuda.Event(enable_timing=True)
+        event_pool[f'backward-{i}-start'] = torch.cuda.Event(enable_timing=True)
+        event_pool[f'backward-{i}-end'] = torch.cuda.Event(enable_timing=True)
+
+    if ENABLE_PP_TIMER:
+        torch.distributed.barrier()
+        start_event.record()
 
     if isinstance(model, list):
         assert (
@@ -1873,6 +1966,7 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
+
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -1885,6 +1979,9 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = recv_forward(
             recv_tensor_shapes, config, parallel_state.is_pipeline_first_stage()
         )
+        # Record forward start event
+        if ENABLE_PP_TIMER:
+            event_pool[f'forward-{i}-start'].record()
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1899,10 +1996,14 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
+        # Record forward end event
+        if ENABLE_PP_TIMER:
+            event_pool[f'forward-{i}-end'].record()
         send_forward(
             output_tensor, send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
         )
         total_num_tokens += num_tokens
+        total_num_tokens += num_tokens.item()
 
         if not forward_only:
             input_tensors.append(input_tensor)
@@ -1919,6 +2020,7 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
+        microbatch_id = i + num_warmup_microbatches
         last_iteration = i == (num_microbatches_remaining - 1)
 
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -1929,6 +2031,9 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        # Record forward start event
+        if ENABLE_PP_TIMER:
+            event_pool[f'forward-{microbatch_id}-start'].record()
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1946,6 +2051,10 @@ def forward_backward_pipelining_without_interleaving(
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
         total_num_tokens += num_tokens
+
+        # Record forward end event
+        if ENABLE_PP_TIMER:
+            event_pool[f'forward-{microbatch_id}-end'].record()
 
         if forward_only:
             send_forward(
@@ -1978,9 +2087,15 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            # Record backward start event for the corresponding microbatch
+            if ENABLE_PP_TIMER:
+                event_pool[f'backward-{i}-start'].record()
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            # Record backward end event
+            if ENABLE_PP_TIMER:
+                event_pool[f'backward-{i}-end'].record()
 
             if last_iteration:
                 input_tensor = None
@@ -2001,6 +2116,7 @@ def forward_backward_pipelining_without_interleaving(
     # Run cooldown backward passes.
     if not forward_only:
         for i in range(num_warmup_microbatches):
+            backward_id = i + num_microbatches_remaining
 
             # Enable async grad reduction in the last backward pass
             # Note: If grad sync function is provided, only enable
@@ -2018,9 +2134,15 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
             )
 
+            # Record backward start event
+            if ENABLE_PP_TIMER:
+                event_pool[f'backward-{backward_id}-start'].record()
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            # Record backward end event
+            if ENABLE_PP_TIMER:
+                event_pool[f'backward-{backward_id}-end'].record()
 
             send_backward(
                 input_tensor_grad,
@@ -2051,6 +2173,37 @@ def forward_backward_pipelining_without_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
+    # Record end event
+    if ENABLE_PP_TIMER:
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+
+        torch.cuda.synchronize()
+
+        # Calculate elapsed time for each event compared to start event
+        event_times = {}
+        for event_name, event in event_pool.items():
+            event_times[event_name] = start_event.elapsed_time(event)
+
+        # Add total execution time
+        event_times['total-execution-time'] = start_event.elapsed_time(end_event)
+        rank = torch.distributed.get_rank()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        PP_size = parallel_state.get_pipeline_model_parallel_world_size()
+        VPP_size = 1
+        TPxCPxDP_rank = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        ).rank()
+        import json
+        import os
+
+        log_dir = os.environ.get('PP_TIMIER_LOG_DIR', './pp_timer_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        with open(
+            f'{log_dir}/event_times_PP{PP_size}_VPP{VPP_size}_TPxCPxDP_rank_{TPxCPxDP_rank}_pp_rank_{pp_rank}_rank_{rank}.json',
+            'w',
+        ) as f:
+            json.dump(event_times, f)
     if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
         create_cudagraphs()
 

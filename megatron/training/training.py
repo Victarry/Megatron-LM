@@ -1362,6 +1362,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         gc.collect()
         torch.cuda.empty_cache()
 
+    from megatron.core.pipeline_parallel.schedules import set_enable_pp_timer
+    import os
+    if os.environ.get('ENABLE_PP_TIMER', '0') == '1':
+        if int(os.environ.get('ENABLE_PP_TIMER_ITER', '10')) == args.curr_iteration:
+            set_enable_pp_timer(True)
+
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
@@ -1390,6 +1396,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+    set_enable_pp_timer(False)
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
