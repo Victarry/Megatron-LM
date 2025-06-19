@@ -42,6 +42,7 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
     is_te_min_version,
@@ -847,6 +848,40 @@ def pretrain(
     # Print setup timing.
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True)
+
+
+    print_rank_0(f"first step warmup")
+    def warmup_cuda():
+        with model[0].no_sync():
+            model[0].disable_forward_pre_hook()
+            dtype = torch.float32
+            if config.bf16:
+                dtype = torch.bfloat16
+            elif config.fp16:
+                dtype = torch.float16
+            seq_len = args.seq_length // args.tensor_model_parallel_size
+            gpt_model = get_attr_wrapped_model(model[0], 'decoder', return_model_obj=True)
+            if gpt_model.pre_process:
+                decoder_input = None
+            else:
+                decoder_input = torch.randn(seq_len, 1, config.hidden_size, device='cuda', dtype=dtype).view(seq_len, 1, config.hidden_size)
+            input_ids = torch.randint(0, 128, (seq_len, 1), device='cuda')
+            position_ids = torch.randint(0, seq_len, (seq_len, 1), device='cuda')
+            attention_mask = torch.tril(
+                torch.ones((seq_len, seq_len), device='cuda')
+            ).unsqueeze(0)
+            attention_mask = attention_mask < 0.5
+
+            gpt_model.set_input_tensor(decoder_input)
+            output = gpt_model(input_ids, position_ids, attention_mask, decoder_input=decoder_input)
+            output.backward(torch.ones_like(output))
+            model[0].enable_forward_pre_hook()
+            optimizer.zero_grad()
+    timers('warmup-device', log_level=0).start(barrier=True)
+    warmup_cuda()
+    timers('warmup-device').stop()
+    timers.log(['warmup-device'], barrier=True)
+
 
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
