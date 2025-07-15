@@ -326,6 +326,62 @@ def moe_freq_type(x):
         return int(x)
 
 
+def update_arguments_for_memory_tracing(args):
+    # Setting only training for 1 step
+    args.eval_iters = 0
+    args.train_iters = 2
+    args.do_train = True
+
+    # Reducing global batch size to a enough value
+    dp_size = args.world_size // (args.context_parallel_size * args.tensor_model_parallel_size * args.pipeline_model_parallel_size)
+    num_micro_batches = args.global_batch_size // (dp_size * args.micro_batch_size) // args.micro_batch_size
+    min_num_micro_batches = args.pipeline_model_parallel_size * 2
+    if min_num_micro_batches < num_micro_batches:
+        args.global_batch_size = args.global_batch_size * min_num_micro_batches // num_micro_batches
+
+    # Checkpointing related
+    args.save = None
+    args.load = None
+
+    # Data related
+    args.data_path = None
+    args.mock_data = True
+
+    # Distributed related
+    args.enable_gloo_process_groups = False
+
+    # Logging related
+    args.gradient_accumulation_fusion = False
+    args.check_for_nan_in_loss_and_grad = False
+    args.log_params_norm = False
+    args.log_timers_to_tensorboard = False
+    args.tensorboard_dir = None
+    args.wandb_project = None
+
+    # Kernel related
+    args.no_persist_layer_norm = True
+    args.tp_comm_overlap = False
+    args.apply_rope_fusion = False
+    args.moe_permute_fusion = False
+
+    # FP8 related
+    assert args.fp8 is None, "fp8 is not supported in memory tracing"
+
+    # MoE related
+    if args.moe_expert_capacity_factor is None:
+        args.moe_expert_capacity_factor = 1.0
+        print("Warning: moe_expert_capacity_factor is not set, using 1.0 for memory tracing.")
+    args.moe_pad_expert_input_to_capacity = True
+
+    if args.moe_token_dispatcher_type != "alltoall":
+        args.moe_token_dispatcher_type = "alltoall"
+        print("Warning: moe_token_dispatcher_type is set to alltoall for memory tracing.")
+    args.moe_enable_deepep = False
+
+    # Training related
+    args.exit_signal_handler = False
+    args.exit_duration_in_mins = None
+
 def validate_args(args, defaults={}):
 
     # Temporary
@@ -1009,6 +1065,9 @@ def validate_args(args, defaults={}):
             # Legacy checkpointing uses Gloo process groups to collect full distributed
             # optimizer state in the CPU memory of DP rank 0.
             assert args.use_dist_ckpt
+
+    if args.memory_tracing:
+        update_arguments_for_memory_tracing(args)
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -1703,6 +1762,10 @@ def _add_regularization_args(parser):
 def _add_training_args(parser):
     group = parser.add_argument_group(title='training')
 
+    group.add_argument('--memory-tracing', action='store_true',
+                       help='If set, memory tracing mode is enabled and on actual computation is performed.')
+    group.add_argument('--save-peak-memory-snapshot', type=str, default=None,
+                       help='If set, save peak memory snapshot to file.')
     group.add_argument('--micro-batch-size', type=int, default=None,
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '

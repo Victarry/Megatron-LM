@@ -297,6 +297,46 @@ def forward_step(data_iterator, model: GPTModel):
     global stimer
     with stimer(bdata=True):
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+
+        if args.memory_tracing:
+            from torch._subclasses import FakeTensorMode
+            with FakeTensorMode(allow_non_fake_inputs=True):
+                if tokens is not None:
+                    tokens = torch.empty(
+                        tokens.shape,
+                        dtype=tokens.dtype,
+                        device=tokens.device,
+                        requires_grad=tokens.requires_grad
+                    )
+                if labels is not None:
+                    labels = torch.empty(
+                        labels.shape,
+                        dtype=labels.dtype,
+                        device=labels.device,
+                        requires_grad=labels.requires_grad
+                    )
+                if loss_mask is not None:
+                    loss_mask = torch.empty(
+                        loss_mask.shape,
+                        dtype=loss_mask.dtype,
+                        device=loss_mask.device,
+                        requires_grad=loss_mask.requires_grad
+                    )
+                if attention_mask is not None:
+                    attention_mask = torch.empty(
+                        attention_mask.shape,
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                        requires_grad=attention_mask.requires_grad
+                    )
+                if position_ids is not None:
+                    position_ids = torch.empty(
+                        position_ids.shape,
+                        dtype=position_ids.dtype,
+                        device=position_ids.device,
+                        requires_grad=position_ids.requires_grad
+                    )
+
     timers('batch-generator').stop()
 
     with stimer:

@@ -37,6 +37,27 @@ class TransformerConfig(ModelParallelConfig):
     including those in ModelParallelConfig.
     """
 
+    def _update_for_memory_tracing(self):
+        """Update the config for memory tracing."""
+        self.no_persist_layer_norm = True
+        self.tp_comm_overlap = False
+        self.apply_rope_fusion = False
+        self.moe_permute_fusion = False
+
+        # FP8 related
+        assert self.fp8 is None, "fp8 is not supported in memory tracing"
+
+        # MoE related
+        if self.moe_expert_capacity_factor is None:
+            self.moe_expert_capacity_factor = 1.0
+            print("Warning: moe_expert_capacity_factor is not set, using 1.0 for memory tracing.")
+        self.moe_pad_expert_input_to_capacity = True
+
+        if self.moe_token_dispatcher_type != "alltoall":
+            self.moe_token_dispatcher_type = "alltoall"
+            print("Warning: moe_token_dispatcher_type is set to alltoall for memory tracing.")
+        self.moe_enable_deepep = False
+
     ####################
     # model architecture
     ####################
@@ -576,6 +597,9 @@ class TransformerConfig(ModelParallelConfig):
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
+
+    memory_tracing: bool = False
+    """If set, memory tracing mode is enabled and no actual computation is performed."""
 
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
@@ -1208,6 +1232,9 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+
+        if self.memory_tracing:
+            self._update_for_memory_tracing()
 
         assert (
             self.pipeline_model_parallel_size > 0

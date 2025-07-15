@@ -159,6 +159,9 @@ class OptimizerConfig:
     ################
     # Miscellaneous
     ################
+    memory_tracing: bool = False
+    """If true, enable memory tracing."""
+
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 

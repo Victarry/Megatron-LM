@@ -11,6 +11,7 @@ import math
 import os
 import sys
 from typing import List, Optional
+import contextlib
 
 import torch.distributed
 from .log_handler import CustomHandler
@@ -124,6 +125,10 @@ from .global_vars import (
     get_one_logger,
     get_energy_monitor,
 )
+try:
+    from memory_profiler import MemoryTracer
+except ImportError:
+    raise ImportError("MemoryTracer not found. Please install memory-profiler.")
 from . import one_logger_utils
 
 from . import ft_integration
@@ -803,9 +808,19 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
-    )
+    if args.memory_tracing:
+        device = torch.cuda.current_device()
+        estimator = MemoryTracer(device=device)
+    else:
+        estimator = contextlib.nullcontext()
+
+    context_phase = estimator.track_phase("setup_model_and_optimizer") if args.memory_tracing else contextlib.nullcontext()
+    with estimator, context_phase:
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_provider, model_type, checkpointing_context=checkpointing_context
+        )
+    for model_chunk in model:
+        unwrapped_model = unwrap_model(model_chunk)
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -861,18 +876,20 @@ def pretrain(
 
         iteration = 0
         if args.do_train and args.train_iters > 0:
-            iteration, num_floating_point_operations_so_far = train(
-                forward_step_func,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                train_data_iterator,
-                valid_data_iterator,
-                process_non_loss_data_func,
-                config,
-                checkpointing_context,
-                non_loss_data_func,
-            )
+            with estimator:
+                iteration, num_floating_point_operations_so_far = train(
+                    forward_step_func,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    train_data_iterator,
+                    valid_data_iterator,
+                    process_non_loss_data_func,
+                    config,
+                    checkpointing_context,
+                    non_loss_data_func,
+                    estimator
+                )
 
         print_datetime('after training is done')
 
@@ -1357,7 +1374,7 @@ def dummy_train_step(data_iterator):
         batch = get_batch_on_this_cp_rank(batch)
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, estimator):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -1392,17 +1409,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
         # Forward pass.
         forward_backward_func = get_forward_backward_func()
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-        )
+        phase_context = estimator.track_phase(f"forward_backward_iter_{args.curr_iteration}") if args.memory_tracing else contextlib.nullcontext()
+        with phase_context:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn
+            )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
@@ -1419,7 +1438,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    phase_context = estimator.track_phase(f"optimizer_step_iter_{args.curr_iteration}") if args.memory_tracing else contextlib.nullcontext()
+    with phase_context:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if args.memory_tracing:
+        estimator.print_memory_stats(f"train iter {args.curr_iteration}")
+        if args.save_peak_memory_snapshot:
+            estimator.memory_dispatch_mode.save_peak_memory_snapshot_to_file(args.save_peak_memory_snapshot, min_memory_mb=1)
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -2046,6 +2071,7 @@ def train(
     config,
     checkpointing_context,
     non_loss_data_func,
+    estimator
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
@@ -2277,7 +2303,7 @@ def train(
             grad_norm,
             num_zeros_in_grad,
         ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config
+            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, estimator
         )
         ft_integration.on_training_step_end()
         if should_checkpoint:

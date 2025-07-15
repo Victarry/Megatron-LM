@@ -747,6 +747,9 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
+        if self.config.moe_pad_expert_input_to_capacity:
+            num_tokens = permuted_local_hidden_states.shape[0]
+            tokens_per_expert = [num_tokens // self.num_local_experts] * self.num_local_experts
         if self.config.fp8:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(
@@ -950,8 +953,12 @@ class SequentialMLP(MegatronModule):
             return output, output_bias
         else:
             tokens_per_expert = tokens_per_expert.tolist()
-            tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert)
-            probs_list = torch.split(permuted_probs, tokens_per_expert)
+            if self.config.moe_pad_expert_input_to_capacity:
+                tokens_list = torch.chunk(permuted_local_hidden_states, len(tokens_per_expert), 0)
+                probs_list = torch.chunk(permuted_probs, len(tokens_per_expert), 0)
+            else:
+                tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert)
+                probs_list = torch.split(permuted_probs, tokens_per_expert)
 
             output_local_list = []
             output_bias_list = []

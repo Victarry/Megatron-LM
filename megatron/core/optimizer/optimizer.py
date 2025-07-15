@@ -1250,6 +1250,9 @@ class ChainedOptimizer(MegatronOptimizer):
         if found_inf_flag:
             return False, None, None
 
+        if self.config.memory_tracing:
+            return self.step_with_ready_grads(), None, None
+
         grad_norm = self.get_grad_norm()
 
         # Clip gradients.
