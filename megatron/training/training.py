@@ -851,17 +851,17 @@ def pretrain(
 
 
     print_rank_0(f"first step warmup")
-    def warmup_cuda():
-        with model[0].no_sync():
-            if model[0].use_forward_hook:
-                model[0].disable_forward_pre_hook()
+    def warmup_cuda(model_chunk):
+        with model_chunk.no_sync():
+            if model_chunk.use_forward_hook:
+                model_chunk.disable_forward_pre_hook()
             dtype = torch.float32
             if config.bf16:
                 dtype = torch.bfloat16
             elif config.fp16:
                 dtype = torch.float16
             seq_len = args.seq_length // args.tensor_model_parallel_size
-            gpt_model = get_attr_wrapped_model(model[0], 'decoder', return_model_obj=True)
+            gpt_model = get_attr_wrapped_model(model_chunk, 'decoder', return_model_obj=True)
             if gpt_model.pre_process:
                 decoder_input = None
             else:
@@ -876,11 +876,12 @@ def pretrain(
             gpt_model.set_input_tensor(decoder_input)
             output = gpt_model(input_ids, position_ids, attention_mask, decoder_input=decoder_input)
             output.backward(torch.ones_like(output))
-            if model[0].use_forward_hook:
-                model[0].enable_forward_pre_hook()
+            if model_chunk.use_forward_hook:
+                model_chunk.enable_forward_pre_hook()
             optimizer.zero_grad()
     timers('warmup-device', log_level=0).start(barrier=True)
-    warmup_cuda()
+    for model_chunk in model:
+        warmup_cuda(model_chunk)
     timers('warmup-device').stop()
     timers.log(['warmup-device'], barrier=True)
 
