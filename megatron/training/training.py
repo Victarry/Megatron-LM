@@ -860,14 +860,14 @@ def pretrain(
                 dtype = torch.bfloat16
             elif config.fp16:
                 dtype = torch.float16
-            seq_len = args.seq_length // args.tensor_model_parallel_size
+            seq_len = args.seq_length
             gpt_model = get_attr_wrapped_model(model_chunk, 'decoder', return_model_obj=True)
             if gpt_model.pre_process:
                 decoder_input = None
             else:
-                decoder_input = torch.randn(seq_len, 1, config.hidden_size, device='cuda', dtype=dtype).view(seq_len, 1, config.hidden_size)
-            input_ids = torch.randint(0, 128, (seq_len, 1), device='cuda')
-            position_ids = torch.randint(0, seq_len, (seq_len, 1), device='cuda')
+                decoder_input = torch.randn(1, seq_len, config.hidden_size, device='cuda', dtype=dtype)
+            input_ids = torch.randint(0, 128, (1, seq_len), device='cuda')
+            position_ids = torch.randint(0, seq_len, (1, seq_len), device='cuda')
             attention_mask = torch.tril(
                 torch.ones((seq_len, seq_len), device='cuda')
             ).unsqueeze(0)
