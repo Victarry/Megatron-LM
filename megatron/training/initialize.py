@@ -332,9 +332,13 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
-
-        torch.distributed.init_process_group(**init_process_group_kwargs)
-        inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        if args.memory_tracing:
+            # Use fake distributed backend for memory tracing
+            from memory_profiler.core.memory_tracer import MemoryTracer
+            MemoryTracer.fake_init_process_group()
+        else:
+            torch.distributed.init_process_group(**init_process_group_kwargs)
+            inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
