@@ -11,15 +11,19 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.optimizer.muon import TensorParallelMuon, get_megatron_muon_optimizer
+from megatron.core.optimizer.muon import (
+    HAVE_EMERGING_OPTIMIZERS,
+    TensorParallelMuon,
+    get_megatron_muon_optimizer,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 # Skip all tests in this file for LTS versions
 pytestmark = pytest.mark.skipif(
-    Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
-    reason="Skip muon optimizer for LTS test",
+    not HAVE_EMERGING_OPTIMIZERS,
+    reason="Emerging Optimizers is not installed",
 )
 
 
