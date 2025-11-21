@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
@@ -42,6 +42,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
      num_local_tokens: S/TP*B
      num_global_tokens: num_local_tokens*TP*EP
 """
+
+logger = logging.getLogger(__name__)
 
 
 class MoETokenDispatcher:
@@ -1013,7 +1015,6 @@ class _DeepepManager(_DispatchManager):
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
-                logger = logging.getLogger(__name__)
                 logger.warning(
                     "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
