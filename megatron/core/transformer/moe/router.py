@@ -128,12 +128,6 @@ class Router(ABC, MegatronModule):
         """Set the layer number for the router."""
         self.layer_number = layer_number
 
-def get_tokens_per_expert(
-    routing_map: torch.Tensor, 
-    reduce_group: torch.distributed.ProcessGroup, 
-    with_padding_mask: bool = False
-) -> torch.Tensor:
-    pass
 
 class TopKRouter(Router):
     """Route each token to the top-k experts.
@@ -394,7 +388,6 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_fusion,
-            padding_mask=None,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
