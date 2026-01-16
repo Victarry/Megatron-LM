@@ -326,6 +326,236 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
+    # ============ Echo Mode Fine-Grained Methods ============
+    # These methods are used for fine-grained scheduling with overlap_moe_expert_parallel_comm
+
+    def echo_route_and_reroute(self, hidden_states: torch.Tensor):
+        """Router + gather tokens_per_expert + generate rerouting/offloading plans.
+
+        This method performs routing and rerouting for echo mode:
+        1. Run router to get initial routing probabilities and mapping
+        2. Gather tokens_per_expert across EP ranks
+        3. Generate offloading plan to redistribute tokens to echo experts
+
+        Args:
+            hidden_states (torch.Tensor): The input tensor to route.
+
+        Returns:
+            A tuple containing:
+            - probs: Original routing probabilities
+            - routing_map: Original routing map
+            - rerouting_map: Map after rerouting to echo experts
+            - rerouted_probs: Probabilities after rerouting
+            - expert_offloading_map: Map indicating which experts are offloaded
+        """
+        with torch.cuda.nvtx.range("router"):
+            probs, routing_map = self.router(hidden_states)
+
+        with torch.cuda.nvtx.range("rerouting"):
+            tokens_per_expert_current_ep_rank = routing_map.sum(dim=0)
+            tokens_per_expert_per_ep_rank = gather_from_sequence_parallel_region(
+                tokens_per_expert_current_ep_rank, group=self.ep_group
+            ).reshape(self.ep_group.size(), self.config.num_moe_experts)
+
+            # Generate offloading plan to redistribute tokens to echo experts
+            if self.config.moe_echo_enable_random_offloading:
+                rerouting_map, rerouted_probs, expert_offloading_map = gen_random_offloading_plan(
+                    routing_map,
+                    probs,
+                    tokens_per_expert_per_ep_rank,
+                    self.ep_group.rank(),
+                    ep=self.ep_group.size(),
+                    spare_expert_per_ep_rank=self.config.moe_num_echo_experts // self.ep_group.size(),
+                )
+            else:
+                num_spare_experts_per_ep_rank = self.config.moe_num_echo_experts // self.ep_group.size()
+                if num_spare_experts_per_ep_rank == 1:
+                    assignment_algorithm = "approx_bin_packing"
+                else:
+                    assignment_algorithm = "one_shot_greedy"
+                rerouting_map, rerouted_probs, expert_offloading_map = gen_offloading_plan(
+                    routing_map,
+                    probs,
+                    tokens_per_expert_per_ep_rank,
+                    self.ep_group.rank(),
+                    num_ep_ranks=self.ep_group.size(),
+                    num_spare_experts_per_ep_rank=num_spare_experts_per_ep_rank,
+                    assignment_algorithm=assignment_algorithm,
+                )
+
+            # Optional logging
+            if self.config.moe_echo_dump_dir is not None:
+                GLOBAL_MOE_ROUTING_TRACKER.set_rank_info(self.ep_group)
+                num_offloaded_experts_per_rank = expert_offloading_map.reshape(self.ep_group.size(), -1).sum(dim=-1)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "num_offloaded_experts_per_rank", num_offloaded_experts_per_rank)
+                rerouted_tokens_per_rank = rerouting_map.sum(dim=0).reshape(self.ep_group.size(), -1).sum(dim=-1)
+                torch.distributed.all_reduce(rerouted_tokens_per_rank, group=self.ep_group, op=torch.distributed.ReduceOp.SUM)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "rerouted_tokens_per_rank", rerouted_tokens_per_rank)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "tokens_per_expert_per_ep_rank", tokens_per_expert_per_ep_rank)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "tokens_per_rank",
+                    tokens_per_expert_per_ep_rank.reshape(self.ep_group.size(), self.ep_group.size(), -1).sum(dim=[0, 2]))
+
+        return probs, routing_map, rerouting_map, rerouted_probs, expert_offloading_map
+
+    def echo_expert_dispatch_preprocess(self, expert_offloading_map: torch.Tensor):
+        """Preprocess for expert weight dispatch.
+
+        Args:
+            expert_offloading_map (torch.Tensor): Map indicating which experts are offloaded.
+
+        Returns:
+            Expert dispatch metadata for use in echo_expert_dispatch.
+        """
+        return self.expert_dispatcher.preprocess(expert_offloading_map)
+
+    def echo_expert_dispatch(
+        self,
+        fc1_expert_dispatch_metadata,
+        fc2_expert_dispatch_metadata,
+        fc1_expert_checkpoint=None,
+        fc2_expert_checkpoint=None,
+    ):
+        """Dispatch expert weights (fc1/fc2) to echo experts.
+
+        This method runs on the comm stream and dispatches expert weights
+        to the echo expert slots. Supports recompute via CheckpointWithoutOutput.
+
+        Args:
+            fc1_expert_dispatch_metadata: Metadata from echo_expert_dispatch_preprocess for fc1.
+            fc2_expert_dispatch_metadata: Metadata from echo_expert_dispatch_preprocess for fc2.
+            fc1_expert_checkpoint: Optional CheckpointWithoutOutput for fc1 recompute.
+            fc2_expert_checkpoint: Optional CheckpointWithoutOutput for fc2 recompute.
+
+        Returns:
+            A tuple of (fc1_expert_checkpoint, fc2_expert_checkpoint) for recompute registration.
+        """
+        with torch.cuda.nvtx.range("expert_dispatch"):
+            # Get fc1 expert weights
+            fc1_expert_weights = self.experts.get_expert_weights(
+                "fc1", self.home_expert_indices
+            )
+
+            # Dispatch fc1 weights with optional recompute
+            if self.config.moe_echo_recompute_expert_dispatch:
+                if fc1_expert_checkpoint is None:
+                    fc1_expert_checkpoint = tensor_parallel.CheckpointWithoutOutput(only_calculate_input_grad=True)
+                dispatched_fc1_weights = fc1_expert_checkpoint.checkpoint(
+                    partial(
+                        self.expert_dispatcher.expert_dispatch,
+                        fc1_expert_dispatch_metadata,
+                    ),
+                    *fc1_expert_weights,
+                )
+            else:
+                dispatched_fc1_weights = self.expert_dispatcher.expert_dispatch(
+                    fc1_expert_dispatch_metadata,
+                    *fc1_expert_weights,
+                )
+
+            self.experts.set_expert_weights(
+                "fc1",
+                dispatched_fc1_weights,
+                self.echo_expert_indices,
+            )
+
+            # Get fc2 expert weights
+            fc2_expert_weights = self.experts.get_expert_weights(
+                "fc2", self.home_expert_indices
+            )
+
+            # Dispatch fc2 weights with optional recompute
+            if self.config.moe_echo_recompute_expert_dispatch:
+                if fc2_expert_checkpoint is None:
+                    fc2_expert_checkpoint = tensor_parallel.CheckpointWithoutOutput(only_calculate_input_grad=True)
+                dispatched_fc2_weights = fc2_expert_checkpoint.checkpoint(
+                    partial(
+                        self.expert_dispatcher.expert_dispatch,
+                        fc2_expert_dispatch_metadata,
+                    ),
+                    *fc2_expert_weights,
+                )
+            else:
+                dispatched_fc2_weights = self.expert_dispatcher.expert_dispatch(
+                    fc2_expert_dispatch_metadata,
+                    *fc2_expert_weights,
+                )
+
+            self.experts.set_expert_weights(
+                "fc2",
+                dispatched_fc2_weights,
+                self.echo_expert_indices,
+            )
+
+        return fc1_expert_checkpoint, fc2_expert_checkpoint
+
+    def echo_preprocess(self, hidden_states: torch.Tensor, rerouted_probs: torch.Tensor, rerouting_map: torch.Tensor):
+        """Token dispatch preprocessing with rerouted probs/map.
+
+        Args:
+            hidden_states (torch.Tensor): The input hidden states.
+            rerouted_probs (torch.Tensor): Probabilities after rerouting.
+            rerouting_map (torch.Tensor): Map after rerouting to echo experts.
+
+        Returns:
+            A tuple containing:
+            - hidden_states: Preprocessed hidden states for dispatch
+            - probs: Preprocessed probabilities
+            - metadata: Token dispatch metadata
+        """
+        with torch.cuda.nvtx.range("token_dispatch_preprocess"):
+            metadata = self.token_dispatcher.preprocess(rerouting_map)
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, rerouted_probs, metadata
+            )
+        return hidden_states, probs, metadata
+
+    def echo_routed_experts_compute(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, metadata
+    ):
+        """Computes the output of the routed experts for echo mode.
+
+        This method is similar to routed_experts_compute but designed for echo mode
+        fine-grained scheduling.
+
+        Args:
+            hidden_states (torch.Tensor): Dispatched tokens.
+            probs (torch.Tensor): Dispatched probabilities.
+            metadata: Token dispatch metadata.
+
+        Returns:
+            A tuple containing the output tensor and the MLP bias.
+        """
+        with torch.cuda.nvtx.range("expert_compute"):
+            dispatched_input, tokens_per_expert, permuted_probs = (
+                self.token_dispatcher.dispatch_postprocess(hidden_states, probs, metadata)
+            )
+            expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+
+        with torch.cuda.nvtx.range("token_combine_preprocess"):
+            output = self.token_dispatcher.combine_preprocess(expert_output, metadata)
+
+        return output, mlp_bias
+
+    def echo_combine(self, output: torch.Tensor, metadata, shared_expert_output: Optional[torch.Tensor] = None):
+        """Combines expert outputs for echo mode.
+
+        Args:
+            output (torch.Tensor): Output from experts after combine_preprocess.
+            metadata: Token dispatch metadata.
+            shared_expert_output (Optional[torch.Tensor]): Output from shared experts if any.
+
+        Returns:
+            The combined output tensor.
+        """
+        with torch.cuda.nvtx.range("token_combine"):
+            output = self.token_dispatcher.token_combine(output, metadata)
+            output = self.token_dispatcher.combine_postprocess(output, metadata)
+        if shared_expert_output is not None:
+            output = output + shared_expert_output
+        return output
+
+    # ============ End Echo Mode Fine-Grained Methods ============
+
     def echo_forward(self, hidden_states: torch.Tensor):
         """Forward pass for the MoE layer with echo experts.
 
@@ -459,14 +689,9 @@ class MoELayer(BaseMoELayer):
 
             # Step 5: Expert computation
             with torch.cuda.nvtx.range("expert_compute"):
-                if self.config.moe_echo_expert_dispatch_overlap:
-                    expert_output, mlp_bias = self.experts(
-                        dispatched_input, tokens_per_expert, permuted_probs, MoELayer.fc1_expert_dispatch_event, MoELayer.fc2_expert_dispatch_event
-                    )
-                else:
-                    expert_output, mlp_bias = self.experts(
-                        dispatched_input, tokens_per_expert, permuted_probs
-                    )
+                expert_output, mlp_bias = self.experts(
+                    dispatched_input, tokens_per_expert, permuted_probs
+                )
 
             with torch.cuda.nvtx.range("token_combine"):
                 # Step 6: Token combine

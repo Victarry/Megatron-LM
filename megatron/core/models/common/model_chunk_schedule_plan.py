@@ -36,10 +36,21 @@ class TransformerLayerSchedulePlan:
     including attention, post attention, MLP, dispatch, combine and
     mtp post process nodes.
 
+    For standard MoE:
     layer (TransformerLayerSchedulePlan)
     ├── attn (TransformerLayerNode): attention module
     ├── post_attn (TransformerLayerNode): layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
+    ├── mlp (TransformerLayerNode): mlp module
+    ├── moe_combine (TransformerLayerNode): combine All2All
+    └── mtp_post_process (PostProcessNode): mtp post process
+
+    For Echo MoE (adds echo_expert_dispatch):
+    layer (TransformerLayerSchedulePlan)
+    ├── attn (TransformerLayerNode): attention module
+    ├── post_attn (TransformerLayerNode): layernorm -> router -> rerouting -> expert dispatch preprocess
+    ├── echo_expert_dispatch (TransformerLayerNode): expert weight All2All (comm stream)
+    ├── moe_dispatch (TransformerLayerNode): token dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
     └── mtp_post_process (PostProcessNode): mtp post process
@@ -54,6 +65,7 @@ class TransformerLayerSchedulePlan:
 
     attn = None
     post_attn = None
+    echo_expert_dispatch = None  # Echo mode only: expert weight A2A
     moe_dispatch = None
     mlp = None
     moe_combine = None
@@ -90,7 +102,7 @@ class TransformerLayerSchedulePlan:
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
-            attn, post_attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
+            attn, post_attn, echo_expert_dispatch, moe_dispatch, mlp, moe_combine, and mtp_post_process.
         """
         from megatron.core.models.gpt.fine_grained_callables import (
             TransformerLayerNode,
@@ -109,6 +121,7 @@ class TransformerLayerSchedulePlan:
             if is_mtp
             else isinstance(self.layer.mlp, MoELayer)
         )
+        is_echo = is_moe and self.layer.config.moe_enable_echo
 
         use_flex_dispatcher = self.layer.config.moe_token_dispatcher_type == "flex"
         extra_args["use_flex_dispatcher"] = use_flex_dispatcher
@@ -130,9 +143,11 @@ class TransformerLayerSchedulePlan:
                 extra_args=extra_args,
             )
 
+        # Unpack 7 elements (echo_expert_dispatch_module may be None for non-echo mode)
         (
             attn_module,
             post_attn_module,
+            echo_expert_dispatch_module,
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
@@ -147,8 +162,16 @@ class TransformerLayerSchedulePlan:
             self.post_attn = create_node(comp_stream, post_attn_module, "post_attn")
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
+            # Echo mode: add echo_expert_dispatch node on comm stream
+            if is_echo and echo_expert_dispatch_module is not None:
+                self.echo_expert_dispatch = create_node(
+                    comm_stream, echo_expert_dispatch_module, "echo_expert_dispatch"
+                )
+            else:
+                self.echo_expert_dispatch = NoopScheduleNode()
         else:
             self.post_attn = NoopScheduleNode()
+            self.echo_expert_dispatch = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
 
@@ -180,9 +203,17 @@ class TransformerLayerSchedulePlan:
         (dispatch or combine) of one with the computations (att or mlp) of the other
         to maximize parallelism and efficiency.
 
-        When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
+        For standard MoE, when f_layer and b_layer are not None:
         comm_stream: combine_bwd            | dispatch_fwd->dispatch_bwd  | combine_fwd
         comp_stream: attn_fwd->post_attn_fwd| mlp_bwd->mlp_bwd_dw->mlp_fwd| post_attn_bwd->attn_bwd
+
+        For Echo MoE (adds echo_expert_dispatch):
+        comm_stream: combine_bwd                         | expert_dispatch_fwd->dispatch_fwd->dispatch_bwd | combine_fwd
+        comp_stream: attn_fwd->post_attn_fwd             | mlp_bwd->mlp_bwd_dw->mlp_fwd                     | expert_dispatch_bwd->post_attn_bwd->attn_bwd
+
+        Note: For echo mode with recompute, expert_dispatch recompute is triggered before combine_bwd
+        via the gradient hook registered in submodule_echo_combine_forward.
+
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
         and mtp_post_process_bwd is executed before the combine_bwd in the comp_stream.
 
@@ -198,8 +229,11 @@ class TransformerLayerSchedulePlan:
             Functions or values for next iteration's computation
         """
 
+        # Phase 1: Backward combine + Forward attn/post_attn
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
+            # For echo mode with recompute, expert_dispatch recompute is triggered
+            # via gradient hook before combine_bwd (registered in echo_combine_forward)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -207,21 +241,28 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.attn.forward(f_input)
                 f_input = f_layer.post_attn.forward(f_input)
 
+        # Phase 2: Backward mlp + Forward echo_expert_dispatch + dispatch
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
+                # Echo mode: expert dispatch on comm stream before token dispatch
+                f_input = f_layer.echo_expert_dispatch.forward(f_input)
                 f_input = f_layer.moe_dispatch.forward(f_input)
 
         if b_layer is not None:
             b_layer.mlp.backward_dw()
             b_grad = b_layer.moe_dispatch.backward(b_grad)
+            # Echo mode: backward for echo_expert_dispatch
+            b_grad = b_layer.echo_expert_dispatch.backward(b_grad)
 
+        # Phase 3: Forward mlp
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.mlp.forward(f_input)
 
+        # Phase 4: Forward combine + Backward post_attn/attn
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)

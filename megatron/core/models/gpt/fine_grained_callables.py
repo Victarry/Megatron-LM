@@ -78,9 +78,36 @@ class TransformerLayerState:
 
     This class holds state that is shared between different nodes
     within a transformer layer.
+
+    Attributes:
+        residual: Residual connection tensor for mlp_bda.
+        metadata: Token dispatch metadata.
+        dispatched_probs: Dispatched probabilities after detach.
+        pre_mlp_layernorm_output: Output from pre-MLP layernorm for shared experts.
+
+        # Echo mode specific fields:
+        expert_dispatch_metadata: Metadata for expert weight dispatch.
+        expert_offloading_map: Map indicating which experts are offloaded.
+        rerouting_map: Map after rerouting to echo experts.
+        rerouted_probs: Probabilities after rerouting.
+        fc1_expert_checkpoint: CheckpointWithoutOutput for fc1 recompute.
+        fc2_expert_checkpoint: CheckpointWithoutOutput for fc2 recompute.
     """
 
-    pass
+    def __init__(self):
+        # Standard MoE fields
+        self.residual = None
+        self.metadata = None
+        self.dispatched_probs = None
+        self.pre_mlp_layernorm_output = None
+
+        # Echo mode specific fields
+        self.expert_dispatch_metadata = None
+        self.expert_offloading_map = None
+        self.rerouting_map = None
+        self.rerouted_probs = None
+        self.fc1_expert_checkpoint = None
+        self.fc2_expert_checkpoint = None
 
 
 class PreProcessNode(ScheduleNode):
@@ -304,12 +331,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
     MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
 
-    The five callables are:
+    For standard MoE, the five callables are:
     1. Attention (computation)
     2. Post-Attention (computation)
     3. MoE Dispatch (communication)
     4. MLP / MoE Experts (computation)
     5. MoE Combine (communication)
+
+    For Echo MoE, we add an extra callable:
+    1. Attention (computation)
+    2. Post-Attention (computation) - includes router + rerouting + expert dispatch preprocess
+    3. Echo Expert Dispatch (communication) - expert weight A2A
+    4. MoE Dispatch (communication) - token A2A
+    5. MLP / MoE Experts (computation)
+    6. MoE Combine (communication)
 
     By assigning these functions to different CUDA streams (e.g., a compute stream
     and a communication stream), the scheduler can overlap their execution, preventing
@@ -327,6 +362,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     is_moe = isinstance(layer.mlp, MoELayer)
     use_flex_dispatcher = layer.config.moe_token_dispatcher_type == "flex"
+    is_echo = is_moe and layer.config.moe_enable_echo
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -371,6 +407,179 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
 
         return local_tokens, probs
+
+    # ============ Echo Mode Callables ============
+
+    def submodule_echo_post_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """
+        Run forward pass for echo mode computations between attention and expert dispatch:
+            pre mlp layernorm -> router -> rerouting -> expert dispatch preprocess -> token dispatch preprocess
+        """
+        if layer.recompute_pre_mlp_layernorm:
+            layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                layer.pre_mlp_layernorm, hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+
+        # Echo mode: route and reroute
+        probs, routing_map, rerouting_map, rerouted_probs, expert_offloading_map = (
+            layer.mlp.echo_route_and_reroute(pre_mlp_layernorm_output)
+        )
+
+        # Store rerouting info in layer state
+        node.layer_state.rerouting_map = rerouting_map
+        node.layer_state.rerouted_probs = rerouted_probs
+        node.layer_state.expert_offloading_map = expert_offloading_map
+
+        # Expert dispatch preprocess - create separate metadata for fc1 and fc2
+        fc1_expert_dispatch_metadata = layer.mlp.echo_expert_dispatch_preprocess(expert_offloading_map)
+        fc2_expert_dispatch_metadata = layer.mlp.echo_expert_dispatch_preprocess(expert_offloading_map)
+        node.layer_state.fc1_expert_dispatch_metadata = fc1_expert_dispatch_metadata
+        node.layer_state.fc2_expert_dispatch_metadata = fc2_expert_dispatch_metadata
+
+        # Token dispatch preprocess with rerouted info
+        local_tokens, probs, metadata = layer.mlp.echo_preprocess(
+            pre_mlp_layernorm_output, rerouted_probs, rerouting_map
+        )
+
+        # Detach here for mlp_bda residual connection
+        node.layer_state.residual = node.detach(hidden_states)
+        node.layer_state.metadata = metadata
+        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
+            # Detach here for shared expert connection
+            node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
+
+        return local_tokens, probs
+
+    def submodule_echo_expert_dispatch_forward(
+        node: ScheduleNode, local_tokens: torch.Tensor, probs: torch.Tensor
+    ):
+        """
+        Expert weight dispatch for echo mode - runs on comm_stream.
+        Dispatches expert weights (fc1/fc2) to echo expert slots.
+        """
+        fc1_expert_dispatch_metadata = node.layer_state.fc1_expert_dispatch_metadata
+        fc2_expert_dispatch_metadata = node.layer_state.fc2_expert_dispatch_metadata
+
+        # Perform expert dispatch with optional recompute support
+        fc1_checkpoint, fc2_checkpoint = layer.mlp.echo_expert_dispatch(
+            fc1_expert_dispatch_metadata,
+            fc2_expert_dispatch_metadata,
+            fc1_expert_checkpoint=node.layer_state.fc1_expert_checkpoint,
+            fc2_expert_checkpoint=node.layer_state.fc2_expert_checkpoint,
+        )
+
+        # Store checkpoints for recompute registration in combine
+        node.layer_state.fc1_expert_checkpoint = fc1_checkpoint
+        node.layer_state.fc2_expert_checkpoint = fc2_checkpoint
+
+        # Pass through the tokens and probs for token dispatch
+        return local_tokens, probs
+
+    def submodule_echo_dispatch_forward(
+        node: ScheduleNode, local_tokens: torch.Tensor, probs: torch.Tensor
+    ):
+        """
+        Token dispatch for echo mode - runs on comm_stream.
+        """
+        if use_flex_dispatcher:
+            # update token_probs to be the detached version, prevents
+            # backward graph from connecting to attn submodule
+            node.layer_state.metadata.token_probs = probs
+
+        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(
+            local_tokens, probs, node.layer_state.metadata
+        )
+        node.layer_state.dispatched_probs = node.detach(dispatched_probs)
+        return dispatched_tokens
+
+    def submodule_echo_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
+        """
+        Run forward pass for echo mode computations between dispatch and combine:
+            post dispatch -> experts -> combine preprocess
+        """
+        shared_expert_output = None
+        dispatched_probs = node.layer_state.dispatched_probs
+        metadata = node.layer_state.metadata
+
+        if use_flex_dispatcher:
+            # update dispatched_probs to be detached version, prevents
+            # backward graph from connecting to dispatch submodule
+            node.layer_state.metadata.dispatched_probs = dispatched_probs
+
+        pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
+        shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+        expert_output, mlp_bias = layer.mlp.echo_routed_experts_compute(
+            dispatched_tokens, dispatched_probs, metadata
+        )
+
+        if layer.recompute_pre_mlp_layernorm:
+            # discard the output of the pre-mlp layernorm and register the recompute
+            # as a gradient hook of expert_output
+            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
+
+        # release tensor reference after use
+        node.layer_state.dispatched_probs = None
+        node.layer_state.pre_mlp_layernorm_output = None
+
+        if shared_expert_output is None:
+            # Return only expert_output, since shared_expert_output causes backward on None
+            return expert_output
+        return expert_output, shared_expert_output
+
+    def submodule_echo_combine_forward(
+        node: ScheduleNode,
+        output: torch.Tensor,
+        shared_expert_output: Optional[torch.Tensor] = None,
+    ):
+        """
+        Token combine for echo mode - runs on comm_stream.
+        Also handles recompute registration for expert dispatch.
+        """
+        residual = node.layer_state.residual
+        metadata = node.layer_state.metadata
+        output = layer.mlp.echo_combine(output, metadata, shared_expert_output)
+        mlp_output_with_bias = (output, None)
+
+        with layer.bias_dropout_add_exec_handler():
+            hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
+                mlp_output_with_bias, residual, layer.hidden_dropout
+            )
+        if layer.offload_mlp_norm:
+            (hidden_states,) = fine_grained_offloading_group_commit(
+                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+            )
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        # Register recompute for expert dispatch if enabled
+        if layer.config.moe_echo_recompute_expert_dispatch:
+            fc1_checkpoint = node.layer_state.fc1_expert_checkpoint
+            fc2_checkpoint = node.layer_state.fc2_expert_checkpoint
+            if fc1_checkpoint is not None:
+                fc1_checkpoint.discard_output_and_register_recompute(output)
+            if fc2_checkpoint is not None:
+                fc2_checkpoint.discard_output_and_register_recompute(output)
+
+        # Need to record residual to comm stream, since it's created on comp stream
+        node.layer_state.residual.record_stream(torch.cuda.current_stream())
+
+        # release tensor reference after use
+        node.layer_state.residual = None
+        node.layer_state.fc1_expert_checkpoint = None
+        node.layer_state.fc2_expert_checkpoint = None
+
+        # final layer norm from decoder
+        final_layernorm = node.chunk_state.model.decoder.final_layernorm
+        if not node.is_mtp and final_layernorm and node.is_last_layer:
+            output = final_layernorm(output)
+            output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
+        return output
+
+    # ============ End Echo Mode Callables ============
 
     def submodule_dispatch_forward(
         node: ScheduleNode, local_tokens: torch.Tensor, probs: torch.Tensor
@@ -475,12 +684,30 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     # Build forward and backward callable functions
     attn_func = submodule_attn_forward
-    post_attn_func = submodule_post_attn_forward if is_moe else raise_not_implemented
-    dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
-    mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
-    combine_func = submodule_combine_forward if is_moe else raise_not_implemented
 
-    forward_funcs = [attn_func, post_attn_func, dispatch_func, mlp_func, combine_func, None]
+    if is_echo:
+        # Echo mode: 7 callables (adds echo_expert_dispatch)
+        post_attn_func = submodule_echo_post_attn_forward
+        echo_expert_dispatch_func = submodule_echo_expert_dispatch_forward
+        dispatch_func = submodule_echo_dispatch_forward
+        mlp_func = submodule_echo_moe_forward
+        combine_func = submodule_echo_combine_forward
+    elif is_moe:
+        # Standard MoE: 6 callables
+        post_attn_func = submodule_post_attn_forward
+        echo_expert_dispatch_func = None
+        dispatch_func = submodule_dispatch_forward
+        mlp_func = submodule_moe_forward
+        combine_func = submodule_combine_forward
+    else:
+        # Dense layer
+        post_attn_func = raise_not_implemented
+        echo_expert_dispatch_func = None
+        dispatch_func = raise_not_implemented
+        mlp_func = mlp_wrapper
+        combine_func = raise_not_implemented
+
+    forward_funcs = [attn_func, post_attn_func, echo_expert_dispatch_func, dispatch_func, mlp_func, combine_func, None]
     backward_dw = {"attn": layer.self_attention, "mlp": layer.mlp}
     return forward_funcs, backward_dw
 
@@ -493,10 +720,17 @@ def build_mtp_layer_callables(layer):
     """
 
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.transformer_layer)
-    attn_forward, post_attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = (
-        forward_funcs
-    )
+    (
+        attn_forward,
+        post_attn_forward,
+        echo_expert_dispatch_forward,
+        dispatch_forward,
+        mlp_forward,
+        combine_forward,
+        _,
+    ) = forward_funcs
     is_moe = isinstance(layer.transformer_layer.mlp, MoELayer)
+    is_echo = is_moe and layer.config.moe_enable_echo
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_attn_forward(node, hidden_states):
@@ -557,6 +791,11 @@ def build_mtp_layer_callables(layer):
     # attn_forward already has rng context, no need to wrap
     attn_func = submodule_mtp_attn_forward
     post_attn_func = partial(rng_context_wrapper, post_attn_forward)
+    echo_expert_dispatch_func = (
+        partial(rng_context_wrapper, echo_expert_dispatch_forward)
+        if echo_expert_dispatch_forward is not None
+        else None
+    )
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
@@ -565,6 +804,7 @@ def build_mtp_layer_callables(layer):
     forward_funcs = [
         attn_func,
         post_attn_func,
+        echo_expert_dispatch_func,
         dispatch_func,
         mlp_func,
         combine_func,

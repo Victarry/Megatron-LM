@@ -632,9 +632,6 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Number of echo experts to use. If None, the number of echo experts is set to
     the number of experts."""
 
-    moe_echo_expert_dispatch_overlap: bool = False
-    """Enable overlap of echo expert dispatch and expert computation."""
-
     moe_echo_recompute_expert_dispatch: bool = False
     """[Experimental] Recompute the expert dispatch for echo experts in the backward pass to reduce the memory overhead.
     It is only effective when moe_enable_echo is enabled."""
@@ -1774,6 +1771,7 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.moe_num_echo_experts % self.expert_model_parallel_size == 0
             ), "moe_num_echo_experts must be divisible by expert_model_parallel_size when moe_enable_echo is True"
+
 
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (
