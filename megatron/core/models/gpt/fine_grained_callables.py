@@ -520,6 +520,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
 
+        # Register recompute for expert dispatch if enabled
+        if layer.config.moe_echo_recompute_expert_dispatch:
+            fc1_checkpoint = node.layer_state.fc1_expert_checkpoint
+            fc2_checkpoint = node.layer_state.fc2_expert_checkpoint
+            if fc1_checkpoint is not None:
+                fc1_checkpoint.discard_output_and_register_recompute(expert_output)
+            if fc2_checkpoint is not None:
+                fc2_checkpoint.discard_output_and_register_recompute(expert_output)
+
         # release tensor reference after use
         node.layer_state.dispatched_probs = None
         node.layer_state.pre_mlp_layernorm_output = None
@@ -554,15 +563,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
-
-        # Register recompute for expert dispatch if enabled
-        if layer.config.moe_echo_recompute_expert_dispatch:
-            fc1_checkpoint = node.layer_state.fc1_expert_checkpoint
-            fc2_checkpoint = node.layer_state.fc2_expert_checkpoint
-            if fc1_checkpoint is not None:
-                fc1_checkpoint.discard_output_and_register_recompute(output)
-            if fc2_checkpoint is not None:
-                fc2_checkpoint.discard_output_and_register_recompute(output)
 
         # Need to record residual to comm stream, since it's created on comp stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())

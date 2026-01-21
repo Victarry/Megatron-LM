@@ -1100,7 +1100,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
 
-        with torch.cuda.stream(torch.cuda.Stream()):
+        from megatron.core.full_cuda_graph import set_param_stream, get_param_stream
+        set_param_stream(torch.cuda.Stream())
+        with torch.cuda.stream(get_param_stream()):
             model = [
                 DP(
                     config=config,

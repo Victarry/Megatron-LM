@@ -14,6 +14,14 @@ logger = logging.getLogger(__name__)
 # present in src and creates a deep copy where all PyTorch tensors are cloned,
 # detached from the computation graph, and moved to CUDA device. Non-tensor objects
 # are returned as-is.
+global param_stream
+def set_param_stream(stream):
+    global param_stream
+    param_stream = stream
+
+def get_param_stream():
+    global param_stream
+    return param_stream
 
 
 def copy_tensors_in_struct(src):
@@ -174,6 +182,7 @@ class FullCudaGraphWrapper:
                 stream=capture_stream,
                 capture_error_mode="thread_local",
             ):
+                get_param_stream().wait_stream(capture_stream)
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )
