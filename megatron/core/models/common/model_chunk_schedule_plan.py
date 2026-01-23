@@ -242,14 +242,14 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.post_attn.forward(f_input)
 
         # Phase 2: Backward mlp + Forward echo_expert_dispatch + dispatch
-        if b_layer is not None:
-            b_grad = b_layer.mlp.backward(b_grad)
-
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 # Echo mode: expert dispatch on comm stream before token dispatch
                 f_input = f_layer.echo_expert_dispatch.forward(f_input)
                 f_input = f_layer.moe_dispatch.forward(f_input)
+
+        if b_layer is not None:
+            b_grad = b_layer.mlp.backward(b_grad)
 
         if b_layer is not None:
             b_layer.mlp.backward_dw()
