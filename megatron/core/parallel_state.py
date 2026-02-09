@@ -2,6 +2,7 @@
 
 """Model and data parallel groups."""
 
+import itertools
 import logging
 import os
 import warnings
@@ -52,6 +53,8 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
+# Expert dispatch parallel group that current rank belongs to.
+_EXPERT_DISPATCH_PARALLEL_GROUP = None
 # Expert tensor parallel group that current rank belongs to.
 _EXPERT_TENSOR_PARALLEL_GROUP = None
 # Expert tensor and model combined parallel group
@@ -559,6 +562,7 @@ def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
+    moe_inter_ep_dispatch_size: int = 1,
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
@@ -1199,6 +1203,32 @@ def initialize_model_parallel(
             _EXPERT_MODEL_PARALLEL_GROUP = group
             _EXPERT_MODEL_PARALLEL_RANKS = ranks
 
+    
+
+    # Build the expert dispatch parallel group
+    global _EXPERT_DISPATCH_PARALLEL_GROUP
+    ep_tp_ranks = expert_decoder_rank_generator.get_ranks('tp-ep')
+    assert (
+        len(ep_tp_ranks) % moe_inter_ep_dispatch_size == 0
+    ), 'moe_inter_ep_dispatch_size must be a divisor of the number of expert ranks'
+    assert (
+        expert_data_parallel_size % moe_inter_ep_dispatch_size == 0
+    ), 'moe_inter_ep_dispatch_size must be a divisor of the expert data parallel size'
+    num_dispatch_groups = len(ep_tp_ranks) // moe_inter_ep_dispatch_size
+    for i in range(num_dispatch_groups):
+        dispatch_ranks = list(
+            itertools.chain(
+                *ep_tp_ranks[i * moe_inter_ep_dispatch_size : (i + 1) * moe_inter_ep_dispatch_size]
+            )
+        )
+        group = create_group(
+            dispatch_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("ep_dispatch", nccl_comm_cfgs),
+            group_desc="EXPERT_DISPATCH_PARALLEL_GROUP",
+        )
+        if rank in dispatch_ranks:
+            _EXPERT_DISPATCH_PARALLEL_GROUP = group
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
     assert (
@@ -1982,6 +2012,15 @@ def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
         return _EXPERT_DATA_PARALLEL_GROUP_GLOO
 
 
+def get_expert_dispatch_parallel_group(check_initialized=True):
+    """Get the expert dispatch parallel group the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _EXPERT_DISPATCH_PARALLEL_GROUP is not None
+        ), "Expert dispatch parallel group is not initialized"
+    return _EXPERT_DISPATCH_PARALLEL_GROUP
+
+
 def get_expert_data_parallel_rank(partial_expert_data_parallel=False):
     """Return caller's rank in the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -2210,6 +2249,9 @@ def destroy_model_parallel():
     ):
         torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+
+    global _EXPERT_DISPATCH_PARALLEL_GROUP
+    _EXPERT_DISPATCH_PARALLEL_GROUP = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None

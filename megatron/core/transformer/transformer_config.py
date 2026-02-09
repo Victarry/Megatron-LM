@@ -688,6 +688,9 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_inter_ep_dispatch_size: int = 1
+    """Number of expert groups for inter-EP token dispatch. None means only dispatch within EP group."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -1655,6 +1658,11 @@ class TransformerConfig(ModelParallelConfig):
                     "allgather and alltoall_seq dispatcher does not support "
                     "moe_router_padding_for_quantization."
                 )
+
+        if self.moe_inter_ep_dispatch_size > 1:
+            assert (
+                self.moe_token_dispatcher_type == "flex" or self.moe_token_dispatcher_type == "alltoall"
+            ), "moe_inter_ep_dispatch_size is only supported with flex token dispatcher or alltoall token dispatcher."
 
         if (
             self.moe_router_topk == 1

@@ -74,6 +74,8 @@ class MoETokenDispatcher:
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
         self.tp_group = pg_collection.expt_tp
         self.tp_ep_group = pg_collection.tp_ep
+        self.dispatch_group = pg_collection.dispatch_pg
+        self.inter_ep_dispatch_size = self.config.moe_inter_ep_dispatch_size
 
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
@@ -386,6 +388,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.num_experts = config.num_moe_experts
         assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
+        if self.inter_ep_dispatch_size > 1:
+            inter_ep_group_rank = self.dispatch_group.rank() // (self.ep_size * self.tp_size)
+            self.local_expert_indices = [x + inter_ep_group_rank * self.num_experts for x in self.local_expert_indices]
         assert (
             len(self.local_expert_indices) == self.num_local_experts
         ), "Invalid local expert indices"
@@ -405,13 +410,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.output_splits_tp = None
         self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else "cpu"
         input_chunk_idxs = torch.arange(
-            self.num_experts * self.tp_size, device=self.permute_idx_device
+            self.inter_ep_dispatch_size * self.num_experts * self.tp_size, device=self.permute_idx_device
         )
-        # [num_local_experts, tp_size * ep_size]. Sort the input chunks by local experts.
+        # [num_local_experts, tp_size * ep_size * inter_ep_size]. Sort the input chunks by local experts.
         self.sort_input_by_local_experts = input_chunk_idxs.reshape(
             -1, self.num_local_experts
         ).T.ravel()
-        # [tp_size * ep_size, num_local_experts]. Restore the output chunks by local experts.
+        # [tp_size * ep_size * inter_ep_size, num_local_experts]. Restore the output chunks by local experts.
         self.restore_output_by_local_experts = input_chunk_idxs.reshape(
             self.num_local_experts, -1
         ).T.ravel()
@@ -467,6 +472,50 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if shared_experts.use_shared_expert_gate:
             self.cudagraph_attrs.append('shared_experts.gate_score')
         self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
+    
+
+    def process_metadata_for_inter_ep_dispatch(
+        self, routing_map: torch.Tensor, probs: torch.Tensor, inter_dispatch_group_size: int
+    ) -> torch.Tensor:
+        """
+        Process the routing map and probs for inter-EP dispatch.
+        routing_map: [num_local_tokens, intra_dispatch_world_size, num_local_experts]
+        probs: [num_local_tokens, intra_dispatch_world_size, num_local_experts]
+        """
+        if inter_dispatch_group_size == 1:
+            return routing_map, probs
+
+        assert self.tp_size == 1, "Inter-EP dispatch is only supported for TP=1 with AlltoAll dispatcher"
+        num_local_tokens, num_experts = routing_map.shape
+        intra_dispatch_world_size = self.ep_size
+        routing_map = routing_map.reshape(
+            num_local_tokens, 1, intra_dispatch_world_size, self.num_local_experts
+        ).repeat(1, inter_dispatch_group_size, 1, 1)
+        probs = probs.reshape(
+            num_local_tokens, 1, intra_dispatch_world_size, self.num_local_experts
+        ).repeat(1, inter_dispatch_group_size, 1, 1)
+
+        # Randomly dispatch the tokens to one of the inter_dispatch_group_size groups
+        inter_dispatch_group_idx = torch.randint(
+            0,
+            inter_dispatch_group_size,
+            (num_local_tokens, 1, intra_dispatch_world_size),
+            device=routing_map.device,
+        )
+        inter_dispatch_mask = torch.zeros(
+            num_local_tokens,
+            inter_dispatch_group_size,
+            intra_dispatch_world_size,
+            1,
+            dtype=torch.bool,
+            device=routing_map.device,
+        )
+        inter_dispatch_mask.scatter_(1, inter_dispatch_group_idx.unsqueeze(-1), True)
+
+        routing_map = (routing_map * inter_dispatch_mask).reshape(num_local_tokens, num_experts * inter_dispatch_group_size)
+        probs = (probs * inter_dispatch_mask).reshape(num_local_tokens, num_experts * inter_dispatch_group_size)
+
+        return routing_map, probs
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
@@ -485,6 +534,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             A tensor with the number of tokens for each local expert.
         """
         if self.drop_and_pad:
+            assert self.inter_ep_dispatch_size == 1, "Inter-EP dispatch size must be 1 for drop and pad"
             # Drop and pad the input to capacity.
             num_tokens = routing_map.size(0) * self.config.moe_router_topk
             self.capacity = get_capacity(
@@ -531,30 +581,30 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # [ep_size]. Represents the number of tokens sent by the current rank to other
             # EP ranks.
             self.input_splits = num_local_tokens_per_expert.reshape(
-                self.ep_size, self.num_local_experts
+                self.ep_size * self.inter_ep_dispatch_size, self.num_local_experts
             ).sum(axis=1)
             # Gather the global distribution of tokens across ranks.
             # num_global_tokens_per_expert represents the number of tokens sent to each
             # expert by all ranks.
-            # [tp_size, ep_size, num_experts]
+            # [tp_size, ep_size*inter_ep_size, num_experts*inter_ep_size]
             num_global_tokens_per_expert = (
                 gather_from_sequence_parallel_region(
-                    num_local_tokens_per_expert, group=self.tp_ep_group
+                    num_local_tokens_per_expert, group=self.dispatch_group
                 )
-                .reshape(self.ep_size, self.tp_size, self.num_experts)
+                .reshape(self.ep_size * self.inter_ep_dispatch_size, self.tp_size, self.inter_ep_dispatch_size * self.num_experts)
                 .transpose(0, 1)
             )
-            # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
+            # [tp_size, ep_size*inter_ep_size, num_experts*inter_ep_size] -> [tp_size, ep_size*inter_ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
             ].contiguous()
-            # [tp_size, ep_size, num_local_experts] -> [tp_size, ep_size]
+            # [tp_size, ep_size*inter_ep_size, num_local_experts] -> [tp_size, ep_size*inter_ep_size]
             num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
-            # [tp_size, ep_size] -> [ep_size]
+            # [tp_size, ep_size*inter_ep_size] -> [ep_size*inter_ep_size]
             # self.output_splits represents the number of tokens received by the current rank
             # from other EP rank.
             self.output_splits = num_global_tokens_per_rank[self.tp_rank]
-            # [tp_size, ep_size] -> [tp_size]
+            # [tp_size, ep_size*inter_ep_size] -> [tp_size]
             # self.output_splits_tp represents the number of tokens received by the current
             # rank from other TP rank.
             self.output_splits_tp = num_global_tokens_per_rank.sum(axis=1)
@@ -622,6 +672,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
             else:
                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
+        
+        self.routing_map, self.probs = self.process_metadata_for_inter_ep_dispatch(self.routing_map, self.probs, self.inter_ep_dispatch_size)
         self.tokens_per_expert = self.preprocess(self.routing_map)
 
         if self.shared_experts is not None:
@@ -639,7 +691,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ) = permute(
             hidden_states,
             self.routing_map,
-            probs=probs,
+            probs=self.probs,
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
@@ -665,11 +717,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
+        if self.inter_ep_dispatch_size > 1:
+            group = self.dispatch_group
+        else:
+            group = self.ep_group
         global_input_tokens = all_to_all(
-            self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
+            group, permutated_local_input_tokens, self.output_splits, self.input_splits
         )
         global_probs = all_to_all(
-            self.ep_group, permuted_probs, self.output_splits, self.input_splits
+            group, permuted_probs, self.output_splits, self.input_splits
         )
 
         return global_input_tokens, global_probs
@@ -809,8 +865,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
+        if self.inter_ep_dispatch_size > 1:
+            group = self.dispatch_group
+        else:
+            group = self.ep_group
         permutated_local_input_tokens = all_to_all(
-            self.ep_group, hidden_states, self.input_splits, self.output_splits
+            group, hidden_states, self.input_splits, self.output_splits
         )
         return permutated_local_input_tokens
 
@@ -1003,8 +1063,8 @@ class _HybridEPManager(_DispatchManager):
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
-        self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
-        self.token_probs = probs.reshape(num_tokens, self.num_experts)
+        self.routing_map = routing_map.reshape(num_tokens, -1)
+        self.token_probs = probs.reshape(num_tokens, -1)
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = num_tokens * self.config.moe_router_topk
@@ -1157,8 +1217,8 @@ class _DeepepManager(_DispatchManager):
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
 
-        routing_map = routing_map.reshape(num_tokens, self.num_experts)
-        probs = probs.reshape(num_tokens, self.num_experts)
+        routing_map = routing_map.reshape(num_tokens, -1)
+        probs = probs.reshape(num_tokens, -1)
         # Convert the format of routing map from multihot to indices.
         self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
         # Mask the indices of dropped tokens with -1
@@ -1348,18 +1408,22 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
         if self.config.moe_flex_dispatcher_backend == "deepep":
             self._comm_manager = _DeepepManager(
-                group=self.tp_ep_group,
+                group=self.dispatch_group,
                 num_local_experts=self.num_local_experts,
                 router_topk=self.tp_size * self.config.moe_router_topk,
-                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_experts=self.inter_ep_dispatch_size
+                * self.tp_size
+                * self.config.num_moe_experts,
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
             self._comm_manager = _HybridEPManager(
-                group=self.tp_ep_group,
+                group=self.dispatch_group,
                 num_local_experts=self.num_local_experts,
-                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_experts=self.inter_ep_dispatch_size
+                * self.tp_size
+                * self.config.num_moe_experts,
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
@@ -1374,6 +1438,44 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         raise NotImplementedError(
             "Shared expert overlap is not supported in Flex Token Dispatcher."
         )
+
+    def process_metadata_for_inter_ep_dispatch(
+        self, routing_map: torch.Tensor, probs: torch.Tensor, inter_dispatch_group_size: int
+    ) -> torch.Tensor:
+        """
+        Process the routing map and probs for inter-EP dispatch.
+        routing_map: [num_local_tokens, intra_dispatch_world_size, num_local_experts]
+        probs: [num_local_tokens, intra_dispatch_world_size, num_local_experts]
+        """
+        num_local_tokens, intra_dispatch_world_size, num_local_experts = routing_map.shape
+        routing_map = routing_map.reshape(
+            num_local_tokens, 1, intra_dispatch_world_size, num_local_experts
+        ).repeat(1, inter_dispatch_group_size, 1, 1)
+        probs = probs.reshape(
+            num_local_tokens, 1, intra_dispatch_world_size, num_local_experts
+        ).repeat(1, inter_dispatch_group_size, 1, 1)
+
+        # Randomly dispatch the tokens to one of the inter_dispatch_group_size groups
+        inter_dispatch_group_idx = torch.randint(
+            0,
+            inter_dispatch_group_size,
+            (num_local_tokens, 1, intra_dispatch_world_size),
+            device=routing_map.device,
+        )
+        inter_dispatch_mask = torch.zeros(
+            num_local_tokens,
+            inter_dispatch_group_size,
+            intra_dispatch_world_size,
+            1,
+            dtype=torch.bool,
+            device=routing_map.device,
+        )
+        inter_dispatch_mask.scatter_(1, inter_dispatch_group_idx.unsqueeze(-1), True)
+
+        routing_map = routing_map * inter_dispatch_mask
+        probs = probs * inter_dispatch_mask
+
+        return routing_map, probs
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
@@ -1425,6 +1527,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         # Initialize metadata
         routing_map, probs = self._initialize_metadata(routing_map, probs)
+
+        if self.inter_ep_dispatch_size > 1:
+            routing_map, probs = self.process_metadata_for_inter_ep_dispatch(
+                routing_map, probs, self.inter_ep_dispatch_size
+            )
 
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs

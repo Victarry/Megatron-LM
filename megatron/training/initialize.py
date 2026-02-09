@@ -382,6 +382,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
                 create_all_gather_group=args.create_all_gather_group,
+                moe_inter_ep_dispatch_size=args.moe_inter_ep_dispatch_size,
             )
             print_rank_0(
                 f"> initialized tensor model parallel with size "

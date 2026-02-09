@@ -95,6 +95,9 @@ class ProcessGroupCollection:
     # _EXPERT_MODEL_PARALLEL_GROUP
     ep: torch.distributed.ProcessGroup = field(init=False)
 
+    # _EXPERT_DISPATCH_PARALLEL_GROUP
+    dispatch_pg: torch.distributed.ProcessGroup = field(init=False)
+
     # _EXPERT_TENSOR_PARALLEL_GROUP
     expt_tp: torch.distributed.ProcessGroup = field(init=False)
 
@@ -236,6 +239,9 @@ class ProcessGroupCollection:
                 parallel_state.get_tensor_and_data_parallel_group,
                 check_initialized=False,
                 with_context_parallel=True,
+            ),
+            'dispatch_pg': partial(
+                parallel_state.get_expert_dispatch_parallel_group, check_initialized=False
             ),
         }
 
