@@ -2669,6 +2669,11 @@ def _add_data_args(parser):
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
+    group.add_argument('--attention-mask-type', type=str, default='causal',
+                       choices=['causal', 'no_mask', 'padding'],
+                       help='Type of attention mask: causal (default, GPT-style), '
+                            'no_mask (full bidirectional, no masking), '
+                            'padding (bidirectional with padding mask).')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--object-storage-cache-path', type=str, default=None,

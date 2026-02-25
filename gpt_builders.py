@@ -9,6 +9,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
     get_gpt_decoder_layer_specs,
 )
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
     get_transformer_layer_with_experimental_attention_variant_spec,
@@ -26,8 +27,16 @@ import megatron.legacy.model  # isort: skip
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
 
 
+_ATTN_MASK_TYPE_MAP = {
+    'causal': AttnMaskType.causal,
+    'no_mask': AttnMaskType.no_mask,
+    'padding': AttnMaskType.padding,
+}
+
+
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
+    attn_mask_type = _ATTN_MASK_TYPE_MAP[args.attention_mask_type]
     if config is None:
         if args.yaml_cfg is not None:
             config = core_transformer_config_from_yaml(args, "language_model")
@@ -62,13 +71,14 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                     normalization=args.normalization,
                     qk_l2_norm=args.qk_l2_norm,
                     vp_stage=vp_stage,
+                    attn_mask_type=attn_mask_type,
                 )
             elif args.heterogeneous_layers_config_path is not None:
                 assert not (config.transformer_impl == "inference_optimized")
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
                 # Define the decoder layer spec
-                transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
+                transformer_layer_spec = _get_transformer_layer_spec(use_te, config, attn_mask_type)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
             assert not (config.transformer_impl == "inference_optimized")
@@ -89,6 +99,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                         use_transformer_engine=use_te,
                         normalization=args.normalization,
                         qk_l2_norm=args.qk_l2_norm,
+                        attn_mask_type=attn_mask_type,
                     )
                 mtp_transformer_layer_spec = decoder_layer_specs[-1]
             # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
@@ -121,14 +132,14 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
     return model
 
 
-def _get_transformer_layer_spec(use_te, config):
+def _get_transformer_layer_spec(use_te, config, attn_mask_type=AttnMaskType.causal):
     """Get transformer layer specification based on configuration.
-    
+
     Args:
         use_te (bool): Whether to use Transformer Engine
-        args: Training arguments
         config: Model configuration
-        
+        attn_mask_type (AttnMaskType): Attention mask type
+
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
@@ -146,12 +157,14 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             fallback_to_eager_attn=config.fallback_to_eager_attn,
+            attn_mask_type=attn_mask_type,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
             args.qk_layernorm,
             args.multi_latent_attention,
             qk_l2_norm=args.qk_l2_norm,
+            attn_mask_type=attn_mask_type,
         )
     else:
         return get_gpt_layer_local_spec(
@@ -165,4 +178,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            attn_mask_type=attn_mask_type,
         )
