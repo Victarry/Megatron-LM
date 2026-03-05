@@ -227,6 +227,10 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 def num_floating_point_operations(args, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch):
+    # For causal attention, only half the attention matrix is computed (lower triangle).
+    # For full attention (no_mask), the entire matrix is computed.
+    causal_factor = 1.0 if getattr(args, 'attention_mask_type', 'causal') == 'no_mask' else 0.5
+
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
@@ -284,7 +288,7 @@ def num_floating_point_operations(args, seqlen_sum_this_global_batch, seqlen_squ
             4
             * hidden_size
             * p
-            * (hidden_size * seqlen_sum_this_global_batch + (hidden_size * (g / num_heads)) * seqlen_sum_this_global_batch + (seqlen_squared_sum_this_global_batch / 2))
+            * (hidden_size * seqlen_sum_this_global_batch + (hidden_size * (g / num_heads)) * seqlen_sum_this_global_batch + (seqlen_squared_sum_this_global_batch * causal_factor))
         )
 
     def mamba_layer_flops(seqlen_sum_this_global_batch, hidden_size, state_dim=16,
@@ -449,8 +453,8 @@ def num_floating_point_operations(args, seqlen_sum_this_global_batch, seqlen_squ
                     ## core attn
                     + seqlen_squared_sum_this_global_batch
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2 # causal mask (only half of the mask is non-zero)
-                    + seqlen_squared_sum_this_global_batch * args.num_attention_heads * args.v_head_dim / 2
+                    * causal_factor  # causal: 0.5 (lower triangle), no_mask: 1.0 (full)
+                    + seqlen_squared_sum_this_global_batch * args.num_attention_heads * args.v_head_dim * causal_factor
                 )
             )
 
@@ -475,7 +479,7 @@ def num_floating_point_operations(args, seqlen_sum_this_global_batch, seqlen_squ
                     ## core attention
                     + query_projection_size
                     * seqlen_squared_sum_this_global_batch
-                    / 2  # causal mask (only half of the mask is non-zero)
+                    * causal_factor  # causal: 0.5 (lower triangle), no_mask: 1.0 (full)
                     * 2  # QK^T and (QK^T)V
                     ## out proj
                     + seqlen_sum_this_global_batch * query_projection_size
