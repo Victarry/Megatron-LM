@@ -11,7 +11,7 @@ from megatron.core.models.backends import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -184,6 +184,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     attn_mask_type: AttnMaskType = AttnMaskType.causal,
+    use_fa4: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -210,9 +211,13 @@ def get_gpt_layer_with_transformer_engine_spec(
             " and will be removed soon. Please update your code accordingly."
         )
 
-    if use_kitchen:
+    if use_fa4:
+        from megatron.core.extensions.flash4_spec_provider import FA4SpecProvider
+
+        backend: BackendSpecProvider = FA4SpecProvider()
+    elif use_kitchen:
         assert HAVE_KITCHEN
-        backend: BackendSpecProvider = KitchenSpecProvider(
+        backend = KitchenSpecProvider(
             fallback=TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn),
             use_kitchen_attention=use_kitchen_attention,
             kitchen_attention_backend=kitchen_attention_backend,
@@ -531,6 +536,8 @@ def get_gpt_decoder_layer_specs(
         f"but got {config.experimental_attention_variant=}."
     )
 
+    use_fa4 = (config.attention_backend == AttnBackend.flash4)
+
     if use_transformer_engine:
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
@@ -542,6 +549,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             attn_mask_type=attn_mask_type,
+            use_fa4=use_fa4,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -553,6 +561,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             attn_mask_type=attn_mask_type,
+            use_fa4=use_fa4,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(

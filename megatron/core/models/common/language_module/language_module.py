@@ -125,6 +125,11 @@ class LanguageModule(MegatronModule):
             check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
+        elif self.config.attention_backend == AttnBackend.flash4:
+            # FA4 bypasses TE attention entirely — disable all TE attention backends
+            check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.flash4)
+            check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.flash4)
+            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.flash4)
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
