@@ -1906,7 +1906,7 @@ class ParamAndGradBuffer:
                 "Please set fsdp_double_buffer=True in the ddp config."
             )
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
-            UB_BUFFER_NUM = 2
+            UB_BUFFER_NUM = 3
             self.weight_alloc = FixedPoolAllocator(
                 name="fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
