@@ -523,9 +523,31 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         )
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
+        return hidden_states
+
+    def submodule_post_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """
+        Run forward pass for computations between attention and dispatch:
+            pre mlp layernorm->router->dispatch preprocess
+        """
+        if layer.offload_mlp_norm:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
+        if layer.recompute_pre_mlp_layernorm:
+            layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+                pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                    layer.pre_mlp_layernorm, hidden_states
+                )
+        else:
+            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+                pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+
+        probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+        local_tokens, probs, metadata = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
+        node.layer_state.metadata = metadata
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
             # Detach here for shared expert connection in moe_combine
             node.layer_state.shared_expert_output = node.detach(shared_expert_output)
@@ -539,16 +561,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep or enable_hybridep:
+        if use_flex_dispatcher:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
-            token_dispatcher._comm_manager.token_probs = probs
+            node.layer_state.metadata.token_probs = probs
 
-        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
-
-        # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
-        # passed to moe_forward within `layer_state` to avoid the free_input process
-        # of the input tensors.
+        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(
+            local_tokens, probs, node.layer_state.metadata
+        )
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
@@ -558,19 +578,18 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             post dispatch->experts->combine preprocess
         """
         dispatched_probs = node.layer_state.dispatched_probs
+        metadata = node.layer_state.metadata
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep or enable_hybridep:
+        if use_flex_dispatcher:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
-            token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
+            node.layer_state.metadata.dispatched_probs = dispatched_probs
 
-        expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
-
-        # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
-        # `routed_experts_compute`, a ref is needed to prevent it from being freed.
-        if enable_hybridep:
-            tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
-            node.layer_state.tokens_per_expert = tokens_per_expert
+        pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
+        shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+        expert_output, mlp_bias = layer.mlp.routed_experts_compute(
+            dispatched_tokens, dispatched_probs, metadata
+        )
 
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -589,10 +608,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # with another microbatch's computation and expose the communication.
         """
         residual = node.layer_state.residual
+        residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
         output = layer.mlp.combine(output)
         output = layer.mlp.postprocess(output, shared_expert_output)
-
         mlp_output_with_bias = (output, None)
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()

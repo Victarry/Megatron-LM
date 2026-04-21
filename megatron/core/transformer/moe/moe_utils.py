@@ -1214,7 +1214,7 @@ class RandomSTE(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, logits: torch.Tensor) -> torch.Tensor:
+    def forward(ctx, logits, static_logits=False):
         """
         Forward pass returns random logits with rank-specific seed.
 
@@ -1224,9 +1224,18 @@ class RandomSTE(torch.autograd.Function):
         Returns:
             torch.Tensor: The random logits.
         """
-        with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
-            random_logits = logits.clone().normal_()
-        return random_logits
+        if static_logits and RandomSTE.random_logits is not None:
+            return RandomSTE.random_logits
+
+        if RandomSTE.generator is None:
+            global_rank = torch.distributed.get_rank()
+            base_seed = 42
+            seed = base_seed + global_rank
+            RandomSTE.generator = torch.Generator(device=logits.device)
+            RandomSTE.generator.manual_seed(seed)
+
+        RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        return RandomSTE.random_logits
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
@@ -1239,10 +1248,10 @@ class RandomSTE(torch.autograd.Function):
         Returns:
             torch.Tensor: The gradient input.
         """
-        return grad_output
+        return grad_output, None
 
 
-def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
+def apply_random_logits(logits, static_logits=False):
     """
     Apply the RandomSTE function to the logits.
 
@@ -1252,7 +1261,7 @@ def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: The random logits.
     """
-    return RandomSTE.apply(logits)
+    return RandomSTE.apply(logits, static_logits)
 
 
 @internal_api
@@ -1336,8 +1345,8 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
+        if te_general_gemm is not None and router_dtype != torch.float64 and weight.dtype == torch.bfloat16:
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN")
             output = output[0]
         elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
@@ -1464,6 +1473,40 @@ def get_default_pg_collection() -> ProcessGroupCollection:
     )
     return pg_collection
 
+from collections import defaultdict
+import os
+class MoERoutingTracker:
+    def __init__(self):
+        self.data_dict = {}
+
+    def set_rank_info(self, ep_group):
+        self.ep_group = ep_group
+        self.rank = torch.distributed.get_rank()
+        self.ep_rank = torch.distributed.get_rank(self.ep_group)
+
+    def add_data(self, moe_layer_number: int, key_name: str, data: torch.Tensor):
+        if key_name not in self.data_dict:
+            self.data_dict[key_name] = {}
+        if moe_layer_number not in self.data_dict[key_name]:
+            self.data_dict[key_name][moe_layer_number] = []
+        self.data_dict[key_name][moe_layer_number].append(data.detach())
+
+    def dump_data(self, dir_path: str):
+        for key_name in self.data_dict.keys():
+            for moe_layer_number in self.data_dict[key_name].keys():
+                data_list = self.data_dict[key_name][moe_layer_number]
+                data_tensor = torch.stack(data_list)
+                self.data_dict[key_name][moe_layer_number] = data_tensor
+        if self.ep_rank == 0:
+            file_name = f"data_rank_{self.rank}_ep_rank_{self.ep_rank}.pth"
+            file_path = os.path.join(dir_path, file_name)
+            os.makedirs(dir_path, exist_ok=True)
+            torch.save(self.data_dict, file_path)
+
+    def clear_data(self):
+        self.data_dict = {}
+
+GLOBAL_MOE_ROUTING_TRACKER = MoERoutingTracker()
 
 class MoECudaGraphPartialCaptureSignal(Exception):
     """

@@ -4464,6 +4464,29 @@ def _add_moe_args(parser):
         help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.',
     )
     # Token dispatcher arguments
+    group.add_argument('--moe-enable-echo', action='store_true',
+                       help='[Experimental] Enable Elastic Cloning for Hot Experts (ECHO). '
+                       'This feature dynamically clones frequently used experts to spare/echo experts '
+                       'for better load balancing and reduced communication overhead.')
+    group.add_argument('--moe-echo-dump-dir', type=str, default=None,
+                       help='The directory to dump the echo routing data.')
+    group.add_argument('--moe-echo-recompute-expert-dispatch', action='store_true', 
+                       help='[Experimental] Recompute the expert dispatch for echo experts in the backward pass to reduce the memory overhead. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-expert-dispatch-overlap', action='store_true',
+                       help='Enable overlap of echo expert dispatch and expert computation. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-enable-random-offloading', action='store_true',
+                       help='[Experimental] Enable random offloading for echo experts in the backward pass to reduce the memory overhead. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-expert-dispatcher-type', type=str, default='hybridep', choices=['hybridep', 'alltoall'],
+                       help='The type of expert dispatcher to use for echo experts. Can be either "hybridep" or "alltoall".')
+    group.add_argument('--moe-received-token-capacity', type=float, default=None,
+                       help='The capacity of total received tokens on each ep rank.')
+    group.add_argument('--moe-num-echo-experts', type=int, default=None,
+                       help='[Experimental] Number of echo experts to use for elastic expert cloning. '
+                       'These are spare experts that can receive overflow tokens from overloaded experts. '
+                       'If None, the number of echo experts is set to the number of experts.')
     # MoE communication overlap arguments
 
     group.add_argument(

@@ -786,6 +786,30 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_enable_echo: bool = False
+    """[Experimental] Enable Elastic Cloning for Hot Experts."""
+
+    moe_echo_dump_dir: Optional[str] = None
+    """The directory to dump the echo routing data."""
+
+    moe_num_echo_experts: Optional[int] = None
+    """[Experimental] Number of echo experts to use. If None, the number of echo experts is set to
+    the number of experts."""
+
+    moe_echo_expert_dispatch_overlap: bool = False
+    """Enable overlap of echo expert dispatch and expert computation."""
+
+    moe_echo_recompute_expert_dispatch: bool = False
+    """[Experimental] Recompute the expert dispatch for echo experts in the backward pass to reduce the memory overhead.
+    It is only effective when moe_enable_echo is enabled."""
+
+    moe_echo_expert_dispatcher_type: str = "hybridep"
+    """The type of expert dispatcher to use for echo experts. Can be either "hybridep" or "alltoall"."""
+
+    moe_echo_enable_random_offloading: bool = False
+    """[Experimental] Enable random offloading of echo experts for debugging and numerical verification. 
+    It is only effective when moe_enable_echo is enabled."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -2371,6 +2395,15 @@ class TransformerConfig(ModelParallelConfig):
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
                     f"variable sequence length, please use alltoall dispatcher instead."
                 )
+
+        if self.moe_enable_echo:
+            assert self.gradient_accumulation_fusion is True, "MoE Echo only support gradient accumulation fusion."
+            assert (
+                self.moe_num_echo_experts is not None
+            ), "moe_num_echo_experts must be specified when moe_enable_echo is True"
+            assert (
+                self.moe_num_echo_experts % self.expert_model_parallel_size == 0
+            ), "moe_num_echo_experts must be divisible by expert_model_parallel_size when moe_enable_echo is True"
 
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (

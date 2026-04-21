@@ -1722,7 +1722,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     )
 
             extra_kwargs["ub_name"] = tp_comm_buffer_name
-
             self.expert_parallel = self.config.expert_model_parallel_size > 1
             if is_expert:
                 extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
@@ -1974,14 +1973,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-            )
+            # Don't cache fp8 weights for echo experts
+            # TODO: support fp8 weights dispatch to prevent cast fp8 weights for every micro-batch
+            if self.config.moe_enable_echo:
+                _is_first_microbatch = None
+            else:
+                _is_first_microbatch = (
+                    None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+                )
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
-            self.is_first_microbatch = False
+            if not self.config.moe_enable_echo:
+                self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
             # it returns a single Tensor, we always want to return two
@@ -2062,6 +2067,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """
             singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
             sharded_state_dict = {}
+            num_gemms = self.num_gemms
+            if self.config.moe_enable_echo:
+                num_gemms = self.config.num_moe_experts // self.config.expert_model_parallel_size
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
             grouped_split_cache = {}
 
@@ -2082,7 +2090,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
-            for gemm_idx in range(self.num_gemms):
+            for gemm_idx in range(num_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
                     f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),
