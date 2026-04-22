@@ -491,6 +491,7 @@ class MoELayer(BaseMoELayer):
                 not self.shared_expert_overlap
             ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
+        metadata = self.token_dispatcher.preprocess(routing_map)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, probs, metadata
         )
