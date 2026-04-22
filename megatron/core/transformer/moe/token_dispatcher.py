@@ -1082,7 +1082,7 @@ class _HybridEPManager(_DispatchManager):
 
         # Used for padding the output for each expert
         self.pad_multiple = 0
-        self.received_token_capacity = config.moe_received_token_capacity
+        self.received_token_capacity = config.moe_expert_rank_capacity_factor
 
         if hybrid_ep_dispatch is None:
             raise ImportError("HybridEP is not installed.")

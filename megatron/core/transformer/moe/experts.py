@@ -1334,7 +1334,7 @@ class TEGroupedMLP(MegatronModule):
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
         output_bias = None
-        if self.config.moe_received_token_capacity is not None:
+        if self.config.moe_expert_rank_capacity_factor is not None:
             output = torch.cat(
                 [
                     output,

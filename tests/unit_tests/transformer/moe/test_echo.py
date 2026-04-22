@@ -34,7 +34,7 @@ def run_echo_test(
     topk=1,
     random_seed=1234,
     token_dispatcher_type="alltoall",
-    moe_received_token_capacity=None,
+    moe_expert_rank_capacity_factor=None,
     moe_echo_enable_random_offloading=False,
     moe_echo_expert_dispatcher_type="hybridep",
     verbose=True
@@ -55,7 +55,7 @@ def run_echo_test(
         dtype: Data type for computations (torch.float32, torch.float64, torch.bfloat16)
         random_seed: Random seed for reproducibility
         token_dispatcher_type: Type of token dispatcher ("alltoall" or "flex")
-        moe_received_token_capacity: Received token capacity multiplier
+        moe_expert_rank_capacity_factor: Received token capacity multiplier
         verbose: Whether to print detailed output
     
     Returns:
@@ -86,7 +86,7 @@ def run_echo_test(
             ("TOKEN_DISPATCHER", token_dispatcher_type),
             ("ECHO_EXPERT_DISPATCHER", moe_echo_expert_dispatcher_type),
             ("RANDOM_OFFLOADING", moe_echo_enable_random_offloading),
-            ("CAPACITY", moe_received_token_capacity),
+            ("CAPACITY", moe_expert_rank_capacity_factor),
             ('RANDOM_OFFLOADING', moe_echo_enable_random_offloading),
         ]
         key_width = max(len(k) for k, _ in rows)
@@ -124,7 +124,7 @@ def run_echo_test(
         gated_linear_unit=True,  # swiglu in yaml
         moe_router_dtype='fp32',
         gradient_accumulation_fusion=False,
-        moe_received_token_capacity=moe_received_token_capacity,
+        moe_expert_rank_capacity_factor=moe_expert_rank_capacity_factor,
         moe_router_pre_softmax=True,
         fp8="e4m3" if fp8 else None,
         fp8_recipe="blockwise" if fp8 else None,
@@ -329,7 +329,7 @@ if __name__ == "__main__":
             token_dispatcher_type="alltoall",
             moe_echo_expert_dispatcher_type="alltoall",
             moe_echo_enable_random_offloading=False,
-            moe_received_token_capacity=None,
+            moe_expert_rank_capacity_factor=None,
             **kargs,
         )
 
@@ -343,7 +343,7 @@ if __name__ == "__main__":
             token_dispatcher_type="alltoall",
             moe_echo_expert_dispatcher_type="alltoall",
             moe_echo_enable_random_offloading=True,
-            moe_received_token_capacity=None,
+            moe_expert_rank_capacity_factor=None,
             **kargs,
         )
 
@@ -358,6 +358,6 @@ if __name__ == "__main__":
     #             token_dispatcher_type="alltoall",
     #             moe_echo_expert_dispatcher_type="alltoall",
     #             moe_echo_enable_random_offloading=random_offloading,
-    #             moe_received_token_capacity=None,
+    #             moe_expert_rank_capacity_factor=None,
     #             **kargs,
     #         )

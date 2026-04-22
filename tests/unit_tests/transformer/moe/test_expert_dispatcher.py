@@ -54,7 +54,7 @@ dispatch_config = TransformerConfig(
     gated_linear_unit=True,  # swiglu in yaml
     moe_router_dtype='fp32',
     gradient_accumulation_fusion=False,
-    moe_received_token_capacity=4.0,
+    moe_expert_rank_capacity_factor=4.0,
     moe_router_pre_softmax=True,
 )
 

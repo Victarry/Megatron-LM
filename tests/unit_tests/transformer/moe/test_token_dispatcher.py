@@ -138,7 +138,7 @@ class MoEModelTestContainer:
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_router_dtype="fp32",
-            moe_received_token_capacity=kwargs.get("moe_received_token_capacity", None),
+            moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             moe_router_pre_softmax=moe_router_topk==1,
         )
 
@@ -511,7 +511,7 @@ class TestFlexDispatcher:
             hidden_size=1024,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
                 test_dtype=torch.bfloat16,
-            moe_received_token_capacity=received_token_capacity,
+            moe_expert_rank_capacity_factor=received_token_capacity,
         )
         container.dispatcher_dropless_test()
         # reset experimental flag to False
