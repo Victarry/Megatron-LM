@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from functools import partial
+from typing import Optional, Protocol, Union
 
 import torch
+
+from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -21,10 +25,16 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
     record_dispatch_token_counts,
 )
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.offloading_planner import gen_offloading_plan, gen_random_offloading_plan
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
+    MoEElasticExpertDispatcher,
+    MoESyncFreeElasticExpertDispatcher,
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
 )
@@ -170,16 +180,30 @@ class BaseMoELayer(MegatronModule, ABC):
         assert ep_size > 0, "Expected non-negative expert parallel size"
 
         assert self.config.num_moe_experts % ep_size == 0
-        self.num_local_experts = self.config.num_moe_experts // ep_size
-        local_expert_indices_offset = ep_rank * self.num_local_experts
+        if self.config.moe_enable_echo:
+            self.num_local_total_experts = (
+                self.config.num_moe_experts + self.config.moe_num_echo_experts
+            ) // ep_size
+        else:
+            self.num_local_total_experts = self.config.num_moe_experts // ep_size
+        self.num_home_experts = self.config.num_moe_experts // ep_size
+        local_expert_indices_offset = ep_rank * self.num_local_total_experts
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
         self.local_expert_indices = [
-            local_expert_indices_offset + i for i in range(self.num_local_experts)
+            local_expert_indices_offset + i for i in range(self.num_local_total_experts)
         ]
-        assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+        if self.config.moe_enable_echo:
+            assert all(
+                map(
+                    lambda x: x < self.config.num_moe_experts + self.config.moe_num_echo_experts,
+                    self.local_expert_indices,
+                )
+            )
+        else:
+            assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
         self.router: RouterInterface = None
         self.experts = None
         self.shared_experts = None
@@ -279,21 +303,21 @@ class MoELayer(BaseMoELayer):
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
-                self.num_local_experts,
+                self.num_local_total_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "alltoall":
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
+                self.num_local_total_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
-                self.num_local_experts,
+                self.num_local_total_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
@@ -303,10 +327,32 @@ class MoELayer(BaseMoELayer):
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
             )
 
-        # Initialize experts
-        self.experts = self.submodules.experts(
-            self.num_local_experts, self.config, pg_collection=pg_collection
-        )
+        if config.moe_enable_echo:
+            if config.moe_echo_expert_dispatcher_type == "hybridep":
+                self.expert_dispatcher = MoESyncFreeElasticExpertDispatcher(
+                    config=self.config, pg_collection=pg_collection
+                )
+            elif config.moe_echo_expert_dispatcher_type == "alltoall":
+                self.expert_dispatcher = MoEElasticExpertDispatcher(
+                    config=self.config, pg_collection=pg_collection
+                )
+            else:
+                raise ValueError(f"Unsupported expert dispatcher type: {config.moe_echo_expert_dispatcher_type}")
+            num_echo_local_experts = self.config.moe_num_echo_experts // self.ep_group.size()
+            self.experts = self.submodules.experts(
+                num_echo_local_experts + self.num_home_experts,
+                self.config,
+                pg_collection=pg_collection,
+            )
+            self.echo_expert_indices = list(
+                range(self.num_home_experts, num_echo_local_experts + self.num_home_experts)
+            )
+            self.home_expert_indices = list(range(self.num_home_experts))
+            self.experts.free_expert_parameters(self.echo_expert_indices)
+        else:
+            self.experts = self.submodules.experts(
+                self.num_home_experts, self.config, pg_collection=pg_collection
+            )
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -445,8 +491,9 @@ class MoELayer(BaseMoELayer):
                 not self.shared_expert_overlap
             ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
+        metadata = self.token_dispatcher.preprocess(routing_map)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
+            hidden_states, probs, metadata
         )
         return hidden_states, probs
 
@@ -460,7 +507,7 @@ class MoELayer(BaseMoELayer):
             )
         return int(math.prod(hidden_states.shape[:-1]))
 
-    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor, metadata):
         """Dispatches tokens to assigned expert ranks via communication.
 
         This method performs the actual communication (e.g., All-to-All) to distribute
@@ -473,11 +520,7 @@ class MoELayer(BaseMoELayer):
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
-        """Computes the output of the shared experts.
-
-        If a shared expert is configured and not overlapped with communication,
-        it is computed here.
-        """
+        """Computes the output of the shared experts."""
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
@@ -546,7 +589,7 @@ class MoELayer(BaseMoELayer):
             )
 
         dispatched_input, tokens_per_expert, permuted_probs = (
-            self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
+            self.token_dispatcher.dispatch_postprocess(hidden_states, probs, metadata)
         )
         dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
         if (
@@ -562,7 +605,7 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+        output = self.token_dispatcher.combine_preprocess(expert_output, metadata)
 
         return output, mlp_bias
 
@@ -587,6 +630,175 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
+    def echo_forward(self, hidden_states: torch.Tensor):
+        """Forward pass for the MoE layer with echo experts.
+
+        This implements the echo expert logic where overflow tokens are offloaded
+        to spare/echo experts for better load balancing.
+
+        Args:
+            hidden_states (torch.Tensor): The input tensor to the MoE layer.
+
+        Returns:
+            A tuple containing the output tensor and the MLP bias, if any.
+        """
+        residual = hidden_states
+        router = self.router
+
+        # Step 1: Routing and offloading planning
+        with torch.cuda.nvtx.range("router"):
+            probs, routing_map = router(hidden_states)
+
+        with torch.cuda.nvtx.range("rerouting"):
+            tokens_per_expert_current_ep_rank = routing_map.sum(dim=0)
+            tokens_per_expert_per_ep_rank = gather_from_sequence_parallel_region(
+                tokens_per_expert_current_ep_rank, group=self.ep_group
+            ).reshape(self.ep_group.size(), self.config.num_moe_experts)
+
+            # Generate offloading plan to redistribute tokens to echo experts
+            if self.config.moe_echo_enable_random_offloading:
+                rerouting_map, rerouted_probs, expert_offloading_map = gen_random_offloading_plan(
+                    routing_map,
+                    probs,
+                    tokens_per_expert_per_ep_rank,
+                    self.ep_group.rank(),
+                    ep=self.ep_group.size(),
+                    spare_expert_per_ep_rank=self.config.moe_num_echo_experts // self.ep_group.size(),
+                )
+            else:
+                num_spare_experts_per_ep_rank = self.config.moe_num_echo_experts // self.ep_group.size()
+                if num_spare_experts_per_ep_rank == 1:
+                    assignment_algorithm = "approx_bin_packing"
+                else:
+                    assignment_algorithm = "one_shot_greedy"
+                rerouting_map, rerouted_probs, expert_offloading_map = gen_offloading_plan(
+                    routing_map,
+                    probs,
+                    tokens_per_expert_per_ep_rank,
+                    self.ep_group.rank(),
+                    num_ep_ranks=self.ep_group.size(),
+                    num_spare_experts_per_ep_rank=num_spare_experts_per_ep_rank,
+                    assignment_algorithm=assignment_algorithm,
+                )
+            if self.config.moe_echo_dump_dir is not None:
+                GLOBAL_MOE_ROUTING_TRACKER.set_rank_info(self.ep_group)
+                num_offloaded_experts_per_rank = expert_offloading_map.reshape(self.ep_group.size(), -1).sum(dim=-1)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "num_offloaded_experts_per_rank", num_offloaded_experts_per_rank)
+                rerouted_tokens_per_rank = rerouting_map.sum(dim=0).reshape(self.ep_group.size(), -1).sum(dim=-1)
+                torch.distributed.all_reduce(rerouted_tokens_per_rank, group=self.ep_group, op=torch.distributed.ReduceOp.SUM)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "rerouted_tokens_per_rank", rerouted_tokens_per_rank)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "tokens_per_expert_per_ep_rank", tokens_per_expert_per_ep_rank)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "tokens_per_rank", 
+                    tokens_per_expert_per_ep_rank.reshape(self.ep_group.size(), self.ep_group.size(), -1).sum(dim=[0, 2]))
+        # Step 2: Expert weight dispatch for echo experts
+        # Create checkpoints for gradient computation
+        with torch.cuda.nvtx.range("expert_dispatch"):
+            fc1_expert_checkpoint = tensor_parallel.CheckpointWithoutOutput(only_calculate_input_grad=True)
+            fc2_expert_checkpoint = tensor_parallel.CheckpointWithoutOutput(only_calculate_input_grad=True)
+
+            # Dispatch fc1 expert weights
+            fc1_expert_weights = self.experts.get_expert_weights(
+                "fc1", self.home_expert_indices
+            )
+
+            # TODO: share the same preprocess operation but use different metadata object
+            fc1_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
+            fc2_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
+            if self.config.moe_echo_recompute_expert_dispatch:
+                dispatched_fc1_weights = fc1_expert_checkpoint.checkpoint(
+                    partial(
+                        self.expert_dispatcher.expert_dispatch, 
+                        fc1_expert_dispatch_metadata, 
+                    ),
+                    *fc1_expert_weights,
+                )
+            else:
+                dispatched_fc1_weights = self.expert_dispatcher.expert_dispatch(
+                    fc1_expert_dispatch_metadata,
+                    *fc1_expert_weights,
+                )
+            self.experts.set_expert_weights(
+                "fc1",
+                dispatched_fc1_weights,
+                self.echo_expert_indices,
+            )
+
+            # Dispatch fc2 expert weights
+            fc2_expert_weights = self.experts.get_expert_weights(
+                "fc2", self.home_expert_indices
+            )
+            if self.config.moe_echo_recompute_expert_dispatch:
+                dispatched_fc2_weights = fc2_expert_checkpoint.checkpoint(
+                    partial(
+                        self.expert_dispatcher.expert_dispatch, 
+                        fc2_expert_dispatch_metadata, 
+                    ),
+                    *fc2_expert_weights,
+                )
+            else:
+                dispatched_fc2_weights = self.expert_dispatcher.expert_dispatch(
+                    fc2_expert_dispatch_metadata,
+                    *fc2_expert_weights,
+                )
+            self.experts.set_expert_weights(
+                "fc2",
+                dispatched_fc2_weights,
+                self.echo_expert_indices,
+            )
+
+        # Step 3: Token dispatch preprocess
+        with torch.cuda.nvtx.range("token_dispatch_preprocess"):
+            metadata = self.token_dispatcher.preprocess(rerouting_map)
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, rerouted_probs, metadata
+            )
+        def dispatch_and_compute(hidden_states, probs, metadata):
+            with torch.cuda.nvtx.range("token_dispatch"):
+                dispatched_input, probs = self.token_dispatcher.token_dispatch(
+                    hidden_states, probs, metadata
+                )
+                dispatched_input, tokens_per_expert, permuted_probs = (
+                    self.token_dispatcher.dispatch_postprocess(dispatched_input, probs, metadata)
+                )
+
+            # Step 5: Expert computation
+            with torch.cuda.nvtx.range("expert_compute"):
+                if self.config.moe_echo_expert_dispatch_overlap:
+                    expert_output, mlp_bias = self.experts(
+                        dispatched_input, tokens_per_expert, permuted_probs, MoELayer.fc1_expert_dispatch_event, MoELayer.fc2_expert_dispatch_event
+                    )
+                else:
+                    expert_output, mlp_bias = self.experts(
+                        dispatched_input, tokens_per_expert, permuted_probs
+                    )
+
+            with torch.cuda.nvtx.range("token_combine"):
+                # Step 6: Token combine
+                # expert_output = torch.cat([expert_output, padded_tokens], dim=0) # TODO: remove this with device-inited grouped gemm
+                output = self.token_dispatcher.combine_preprocess(expert_output, metadata)
+                output = self.token_dispatcher.token_combine(output, metadata)
+                output = self.token_dispatcher.combine_postprocess(output, metadata)
+            return output, mlp_bias
+
+        if self.moe_layer_recompute:
+            output, mlp_bias = tensor_parallel.checkpoint(
+                partial(dispatch_and_compute, metadata=metadata), False, hidden_states, probs
+            )
+        else:
+            output, mlp_bias = dispatch_and_compute(hidden_states, probs, metadata)
+
+        # Register for gradient computation
+        if self.config.moe_echo_recompute_expert_dispatch:
+            fc1_expert_checkpoint.discard_output_and_register_recompute(output)
+            fc2_expert_checkpoint.discard_output_and_register_recompute(output)
+
+        # Handle shared expert if configured
+        if self.use_shared_expert and not self.shared_expert_overlap:
+            shared_expert_output = self.shared_experts(residual)
+            output = output + shared_expert_output
+
+        return output, mlp_bias
+
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
 
@@ -608,6 +820,9 @@ class MoELayer(BaseMoELayer):
         3. Expert Computation: Experts process the dispatched tokens.
         4. Combine: The outputs from the experts are combined and returned.
 
+        When echo mode is enabled (moe_enable_echo=True), the forward pass uses an alternative
+        implementation that offloads overflow tokens to echo experts for better load balancing.
+
         Args:
             hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
@@ -624,6 +839,11 @@ class MoELayer(BaseMoELayer):
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
+
+        # ECHO mode uses a separate forward pass that offloads overflow tokens to
+        # echo experts for better load balancing.
+        if self.config.moe_enable_echo:
+            return self.echo_forward(hidden_states)
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):

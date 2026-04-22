@@ -4463,7 +4463,10 @@ def _add_moe_args(parser):
         default=0.0,
         help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.',
     )
-    # Token dispatcher arguments
+    # MoE ECHO args (moe_enable_echo, moe_num_echo_experts, moe_echo_*) are
+    # auto-generated from TransformerConfig dataclass fields by
+    # ArgumentGroupFactory in _add_network_size_args. Do not re-register here.
+
     # MoE communication overlap arguments
 
     group.add_argument(
