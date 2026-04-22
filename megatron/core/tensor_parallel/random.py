@@ -92,6 +92,7 @@ _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 
+from transformer_engine.pytorch.tensor import QuantizedTensor
 
 def _get_cuda_rng_state(
     device: Union[int, str, torch.device] = "cuda", clone: bool = False, graph_safe: bool = False
@@ -575,7 +576,7 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.distribute_saved_activations = distribute_saved_activations
 
         # Copy the rng states.
-        ctx.rng_states = _get_all_rng_states()
+        # ctx.rng_states = _get_all_rng_states()
 
         with torch.no_grad():
             outputs = run_function(*args)
@@ -613,14 +614,11 @@ class CheckpointFunction(torch.autograd.Function):
                 inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
             )
 
-        with _fork_rng():
-            # Set the states to what it used to be before the forward pass.
-            _set_all_rng_states(*ctx.rng_states)
 
-            # Compute the forward pass.
-            detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
-                outputs = ctx.run_function(*detached_inputs)
+        # Compute the forward pass.
+        detached_inputs = detach_variable(inputs)
+        with torch.enable_grad():
+            outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -734,17 +732,45 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
+        ctx.only_calculate_input_grad = checkpoint_without_output_obj.only_calculate_input_grad
         return outputs
 
     @staticmethod
-    def backward(ctx, *args):
+    def backward(ctx, *output_grads):
         """Backward pass."""
-        # Get the inputs from the context instead of the saved tensors
-        # because the saved tensors are already cached by the recomputation.
-        # This is to avoid double-reloading the inputs in CPU offloading scenario.
-        inputs = ctx.inputs
+        inputs = ctx.detached_args
         outputs = ctx.outputs
-        torch.autograd.backward(outputs, args)
+        valid_outputs_with_grad = []
+        valid_output_grads = []
+        for output, output_grad in zip(outputs, output_grads):
+            if torch.is_tensor(output) and output_grad is not None:
+                valid_outputs_with_grad.append(output)
+                valid_output_grads.append(output_grad)
+
+        if ctx.only_calculate_input_grad:
+            # Use torch.autograd.grad() to get gradients directly without accumulating to .grad
+            tensor_inputs = [inp for inp in inputs if isinstance(inp, torch.Tensor) and inp.requires_grad]
+
+            if valid_outputs_with_grad and tensor_inputs:
+                grads = torch.autograd.grad(
+                    outputs=valid_outputs_with_grad,
+                    inputs=tensor_inputs,
+                    grad_outputs=valid_output_grads,
+                    allow_unused=True,
+                )
+                grad_map = {id(inp): grad for inp, grad in zip(tensor_inputs, grads)}
+            else:
+                grad_map = {}
+
+            input_grads = tuple(
+                grad_map.get(id(inp), None) if isinstance(inp, torch.Tensor) else inp
+                for inp in inputs
+            )
+        else:
+            # Use torch.autograd.backward() which accumulates gradients to .grad
+            torch.autograd.backward(valid_outputs_with_grad, grad_tensors=valid_output_grads)
+            input_grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
+
         ctx.outputs = None
         ctx.inputs = None
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
@@ -811,7 +837,7 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False, ckpt_manager=None):
+    def __init__(self, fp8=False, ckpt_manager=None, only_calculate_input_grad=False):
         """
         Initialize CheckpointWithoutOutput.
 
@@ -821,6 +847,9 @@ class CheckpointWithoutOutput(object):
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
+            only_calculate_input_grad: When True, the backward pass returns input
+                         gradients via torch.autograd.grad without accumulating to
+                         .grad. Used by MoE ECHO echo_forward recompute path.
         """
         self.fp8 = bool(fp8)
         self.ckpt_manager = ckpt_manager
@@ -830,6 +859,7 @@ class CheckpointWithoutOutput(object):
         self.fwd_cuda_rng_state_tracker = None
         self.ctx = None
         self.outputs = None
+        self.only_calculate_input_grad = bool(only_calculate_input_grad)
 
     def checkpoint(self, run_function: Callable[[Unpack[_Ts]], _R], *args: Unpack[_Ts]) -> _R:
         """
@@ -848,7 +878,7 @@ class CheckpointWithoutOutput(object):
 
         self.run_function = run_function
 
-        self.rng_states = _get_all_rng_states()
+        # self.rng_states = _get_all_rng_states()
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
@@ -877,17 +907,15 @@ class CheckpointWithoutOutput(object):
                 "please use .backward() if possible"
             )
 
-        with _fork_rng():
-            _set_all_rng_states(*self.rng_states)
 
-            if self.fp8:
-                recompute_ctx = activation_recompute_forward(
-                    activation_recompute=True, recompute_phase=True
-                )
-                fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
-            else:
-                recompute_ctx = contextlib.nullcontext()
-                fp8_ctx = contextlib.nullcontext()
+        if self.fp8:
+            recompute_ctx = activation_recompute_forward(
+                activation_recompute=True, recompute_phase=True
+            )
+            fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
+        else:
+            recompute_ctx = contextlib.nullcontext()
+            fp8_ctx = contextlib.nullcontext()
 
             # Reconstruct full args list from saved ctx
             inputs = _load_args_from_ctx(self.ctx)
@@ -895,10 +923,13 @@ class CheckpointWithoutOutput(object):
                 outputs = self.run_function(*inputs)
 
         self.run_function = None
-        self.rng_states = None
 
-        if isinstance(outputs, torch.Tensor):
+        if isinstance(outputs, tuple):
+            outputs = list([x for x in outputs if isinstance(x, torch.Tensor)])
+        elif isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
+        else:
+            raise ValueError(f"Unsupported output type: {type(outputs)}")
 
         # Zero-copy: make output's StorageImpl point to recomputation_output's data.
         # This operates at the UntypedStorage level (below TensorImpl), so:
@@ -933,8 +964,11 @@ class CheckpointWithoutOutput(object):
         # use resize to release the output tensor memory and still keep the metadata in the tensors.
         # the metadata is still needed for backward
         for output in self.outputs:
-            output.untyped_storage().resize_(0)
-
+            if isinstance(output, QuantizedTensor):
+                output._rowwise_data.untyped_storage().resize_(0)
+                output._columnwise_data.untyped_storage().resize_(0)
+            else:
+                output.untyped_storage().resize_(0)
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected
         # carefully to ensure that the tensors are recomputed before it is used by other backward
