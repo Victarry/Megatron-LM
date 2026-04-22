@@ -640,6 +640,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                         columnwise_scale_inv=col_scale.view(torch.uint8).reshape(-1, weight_shape[1]),
                         fp8_dtype=tex.DType.kFloat8E4M3,
                         quantizer=None,
+                        with_gemm_swizzled_scales=False,
                     )
                 elif quantized_tensor_class is Float8BlockwiseQTensor:
                     weight_tensor = Float8BlockwiseQTensor(
