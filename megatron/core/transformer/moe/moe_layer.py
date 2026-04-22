@@ -840,6 +840,11 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
+        # ECHO mode uses a separate forward pass that offloads overflow tokens to
+        # echo experts for better load balancing.
+        if self.config.moe_enable_echo:
+            return self.echo_forward(hidden_states)
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
