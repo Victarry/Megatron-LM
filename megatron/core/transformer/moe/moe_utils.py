@@ -1213,6 +1213,9 @@ class RandomSTE(torch.autograd.Function):
     This is used to generate random logits of router for load-balanced benchmark.
     """
 
+    generator: Optional[torch.Generator] = None
+    random_logits: Optional[torch.Tensor] = None
+
     @staticmethod
     def forward(ctx, logits, static_logits=False):
         """
