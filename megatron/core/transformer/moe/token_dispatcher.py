@@ -1873,4 +1873,10 @@ class MoESyncFreeElasticExpertDispatcher:
         )
         dispatched_expert_weights = result[:-1]
         metadata.handle = result[-1]
+        # TE GroupedLinear.pre_first_fuser_forward asserts every weight{idx}
+        # shares the same requires_grad as weight0. weight0 is an nn.Parameter
+        # (requires_grad=True); freshly-wrapped dispatched tensors default to
+        # False, so align them explicitly.
+        for w in dispatched_expert_weights:
+            w.requires_grad_(True)
         return dispatched_expert_weights
