@@ -41,7 +41,6 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceCUDAGraphTokenDispatcher,
 )
-from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
@@ -340,10 +339,9 @@ class MoELayer(BaseMoELayer):
             else:
                 raise ValueError(f"Unsupported expert dispatcher type: {config.moe_echo_expert_dispatcher_type}")
             num_echo_local_experts = self.config.moe_num_echo_experts // self.ep_group.size()
-            self.experts = build_module(
-                self.submodules.experts,
+            self.experts = self.submodules.experts(
                 num_echo_local_experts + self.num_home_experts,
-                config=self.config,
+                self.config,
                 pg_collection=pg_collection,
             )
             self.echo_expert_indices = list(
@@ -352,11 +350,8 @@ class MoELayer(BaseMoELayer):
             self.home_expert_indices = list(range(self.num_home_experts))
             self.experts.free_expert_parameters(self.echo_expert_indices)
         else:
-            self.experts = build_module(
-                self.submodules.experts,
-                self.num_home_experts,
-                self.config,
-                pg_collection=pg_collection,
+            self.experts = self.submodules.experts(
+                self.num_home_experts, self.config, pg_collection=pg_collection
             )
 
         # Initialize shared experts
