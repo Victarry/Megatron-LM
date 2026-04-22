@@ -535,9 +535,12 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         ctx.weight_shape = weight_shape
         fp8_dispatch = False
         quantized_tensor_class = None
+        source_quantizer = None
         for weight in expert_weights:
             if HAVE_TE_QUANTIZED_TENSOR and isinstance(weight, QuantizedTensor):
                 quantized_tensor_class = weight.__class__
+                if source_quantizer is None:
+                    source_quantizer = getattr(weight, "_quantizer", None)
                 row_weight, col_weight = weight.get_data_tensors()
                 metadata = weight.get_metadata()
                 row_scale, col_scale = (
@@ -630,6 +633,13 @@ class HybridEPExpertDispatch(torch.autograd.Function):
             for i in range(num_dispatched_weights):
                 row_weight, col_weight = dispatched_raw_weight[i].chunk(2, dim=0)
                 row_scale, col_scale = dispatched_raw_scale[i].chunk(2, dim=0)
+                # Propagate the source weight's quantizer so the wrapped
+                # dispatched weight stays hooked into TE's recipe-state
+                # machinery (reset_recipe_state -> update_quantizer requires
+                # a non-None quantizer as of TE 2.14).
+                wrapped_quantizer = (
+                    source_quantizer.copy() if source_quantizer is not None else None
+                )
                 if quantized_tensor_class is MXFP8Tensor:
                     weight_tensor = MXFP8Tensor(
                         weight_shape,
@@ -639,7 +649,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                         columnwise_data=col_weight.reshape(weight_shape),
                         columnwise_scale_inv=col_scale.view(torch.uint8).reshape(-1, weight_shape[1]),
                         fp8_dtype=tex.DType.kFloat8E4M3,
-                        quantizer=None,
+                        quantizer=wrapped_quantizer,
                         with_gemm_swizzled_scales=False,
                     )
                 elif quantized_tensor_class is Float8BlockwiseQTensor:
@@ -651,7 +661,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                         columnwise_data=col_weight.reshape(weight_shape),
                         columnwise_scale_inv=col_scale.reshape(-1, weight_shape[1]),
                         fp8_dtype=tex.DType.kFloat8E4M3,
-                        quantizer=None,
+                        quantizer=wrapped_quantizer,
                         is_2D_scaled=False,
                     )
                 dispatched_weight_list.append(weight_tensor)
