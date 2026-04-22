@@ -897,16 +897,24 @@ class TEGroupedMLP(MegatronModule):
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
+        # ECHO's free_expert_parameters() replaces some weight{idx} with plain
+        # Tensors (Parameter slot deleted); mirror that on the op so
+        # Module.__setattr__ accepts the assignment.
+        def _copy_weight_like(target, name, source):
+            if not isinstance(source, torch.nn.Parameter) and name in target._parameters:
+                del target._parameters[name]
+            setattr(target, name, source)
+
         if fc1_single_grouped_weight:
-            setattr(op, "weight", getattr(self.linear_fc1, "weight"))
+            _copy_weight_like(op, "weight", getattr(self.linear_fc1, "weight"))
 
         for idx in range(self.linear_fc1.num_gemms):
             if not fc1_single_grouped_weight:
-                setattr(op, f"weight{idx}", getattr(self.linear_fc1, f"weight{idx}"))
+                _copy_weight_like(op, f"weight{idx}", getattr(self.linear_fc1, f"weight{idx}"))
             if self.linear_fc1.use_bias and not fc1_single_grouped_bias:
-                setattr(op, f"bias{idx}", getattr(self.linear_fc1, f"bias{idx}"))
+                _copy_weight_like(op, f"bias{idx}", getattr(self.linear_fc1, f"bias{idx}"))
         if self.linear_fc1.use_bias and fc1_single_grouped_bias:
-            setattr(op, "bias", getattr(self.linear_fc1, "bias"))
+            _copy_weight_like(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
@@ -944,15 +952,15 @@ class TEGroupedMLP(MegatronModule):
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
         if fc2_single_grouped_weight:
-            setattr(op, "weight", getattr(self.linear_fc2, "weight"))
+            _copy_weight_like(op, "weight", getattr(self.linear_fc2, "weight"))
 
         for idx in range(self.linear_fc2.num_gemms):
             if not fc2_single_grouped_weight:
-                setattr(op, f"weight{idx}", getattr(self.linear_fc2, f"weight{idx}"))
+                _copy_weight_like(op, f"weight{idx}", getattr(self.linear_fc2, f"weight{idx}"))
             if self.linear_fc2.use_bias and not fc2_single_grouped_bias:
-                setattr(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
+                _copy_weight_like(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
         if self.linear_fc2.use_bias and fc2_single_grouped_bias:
-            setattr(op, "bias", getattr(self.linear_fc2, "bias"))
+            _copy_weight_like(op, "bias", getattr(self.linear_fc2, "bias"))
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
