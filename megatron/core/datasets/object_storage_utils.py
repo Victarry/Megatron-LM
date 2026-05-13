@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Protocol, Tuple
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 import torch
 
@@ -155,15 +155,17 @@ def _s3_object_exists(client: S3Client, path: str) -> bool:
     return True
 
 
-def is_object_storage_path(path: str) -> bool:
+def is_object_storage_path(path: Optional[str]) -> bool:
     """Ascertain whether a path is in object storage
 
     Args:
-        path (str): The path
+        path (Optional[str]): The path. None for mock datasets.
 
     Returns:
         bool: True if the path is in object storage (s3:// or msc://), False otherwise
     """
+    if path is None:
+        return False
     return _is_s3_path(path) or _is_msc_path(path)
 
 
