@@ -16,14 +16,23 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
+_ATTN_MASK_TYPE_MAP = {
+    'causal': AttnMaskType.causal,
+    'no_mask': AttnMaskType.no_mask,
+    'padding': AttnMaskType.padding,
+}
+
+
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
+    attn_mask_type = _ATTN_MASK_TYPE_MAP[getattr(args, 'attention_mask_type', 'causal')]
     if config is None:
         if args.yaml_cfg is not None:
             config = core_transformer_config_from_yaml(args, "language_model")
@@ -46,13 +55,14 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 normalization=args.normalization,
                 qk_l2_norm=args.qk_l2_norm,
                 vp_stage=vp_stage,
+                attn_mask_type=attn_mask_type,
             )
         elif args.heterogeneous_layers_config_path is not None:
             assert not (config.transformer_impl == "inference_optimized")
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
         else:
             # Define the decoder layer spec
-            transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
+            transformer_layer_spec = _get_transformer_layer_spec(use_te, config, attn_mask_type)
     mtp_block_spec = None
     if args.mtp_num_layers is not None:
         assert not (config.transformer_impl == "inference_optimized")
@@ -62,7 +72,9 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         ):
             # Get the decoder layer spec explicitly if no decoder layer in the last stage,
             # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-            transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+            transformer_layer_spec_for_mtp = _get_transformer_layer_spec(
+                use_te, config, attn_mask_type
+            )
         elif args.experimental_attention_variant is not None:
             # get_gpt_decoder_layer_specs rejects experimental variants;
             # build per-layer specs via the experimental entry point.
@@ -78,6 +90,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 normalization=args.normalization,
                 qk_l2_norm=args.qk_l2_norm,
                 vp_stage=vp_stage,
+                attn_mask_type=attn_mask_type,
             )
             transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
         # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
@@ -107,12 +120,13 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
     return model
 
 
-def _get_transformer_layer_spec(use_te, config):
+def _get_transformer_layer_spec(use_te, config, attn_mask_type=AttnMaskType.causal):
     """Get transformer layer specification based on configuration.
 
     Args:
         use_te (bool): Whether to use Transformer Engine
         config: Model configuration
+        attn_mask_type (AttnMaskType): Attention mask type
 
     Returns:
         transformer_layer_spec: The transformer layer specification
@@ -133,10 +147,14 @@ def _get_transformer_layer_spec(use_te, config):
             enable_hyper_connection=config.enable_hyper_connections,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
             dense_grouped_gemm=config.dense_grouped_gemm,
+            attn_mask_type=attn_mask_type,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
-            config.qk_layernorm, config.multi_latent_attention, qk_l2_norm=config.qk_l2_norm
+            config.qk_layernorm,
+            config.multi_latent_attention,
+            qk_l2_norm=config.qk_l2_norm,
+            attn_mask_type=attn_mask_type,
         )
     else:
         return get_gpt_layer_local_spec(
@@ -150,4 +168,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             enable_hyper_connection=config.enable_hyper_connections,
+            attn_mask_type=attn_mask_type,
         )

@@ -12,7 +12,7 @@ from megatron.core.models.backends import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -79,6 +79,7 @@ def get_gpt_layer_with_inference_submodules(
     qk_l2_norm: Optional[bool] = False,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
+    attn_mask_type: AttnMaskType = AttnMaskType.causal,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for inference optimized linear layers.
     Args:
@@ -113,7 +114,7 @@ def get_gpt_layer_with_inference_submodules(
             input_layernorm=backend.layer_norm(has_residual=True),
             self_attention=ModuleSpec(
                 module=MLASelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=MLASelfAttentionSubmodules(
                     linear_q_proj=backend.column_parallel_linear(),
                     linear_q_down_proj=backend.linear(),
@@ -136,7 +137,7 @@ def get_gpt_layer_with_inference_submodules(
         return TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_layer_norm_linear(),
                     core_attention=backend.core_attention(),
@@ -188,6 +189,8 @@ def get_gpt_layer_with_transformer_engine_submodules(
     enable_hyper_connection: bool = False,
     mla_down_proj_fusion: bool = False,
     dense_grouped_gemm: bool = False,
+    attn_mask_type: AttnMaskType = AttnMaskType.causal,
+    use_fa4: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -218,7 +221,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
             " and will be removed soon. Please update your code accordingly."
         )
 
-    if use_kitchen:
+    if use_fa4:
+        from megatron.core.extensions.flash4_spec_provider import FA4SpecProvider
+
+        backend: BackendSpecProvider = FA4SpecProvider()
+    elif use_kitchen:
         assert HAVE_KITCHEN
         backend: BackendSpecProvider = KitchenSpecProvider(
             fallback=TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn),
@@ -268,7 +275,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 input_layernorm=input_layernorm,
                 self_attention=ModuleSpec(
                     module=FusedMLASelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
+                    params={"attn_mask_type": attn_mask_type},
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=backend.column_parallel_linear(),
                         linear_qkv_down_proj=down_proj_linear,
@@ -298,7 +305,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
             input_layernorm=backend.layer_norm(has_residual=True),
             self_attention=ModuleSpec(
                 module=MLASelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=MLASelfAttentionSubmodules(
                     linear_q_proj=backend.column_parallel_linear(),
                     linear_q_down_proj=backend.linear(),
@@ -323,7 +330,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         return TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_layer_norm_linear(),
                     core_attention=backend.core_attention(),
@@ -376,6 +383,7 @@ def get_gpt_layer_local_submodules(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     enable_hyper_connection: bool = False,
+    attn_mask_type: AttnMaskType = AttnMaskType.causal,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -429,7 +437,7 @@ def get_gpt_layer_local_submodules(
             input_layernorm=layer_norm,
             self_attention=ModuleSpec(
                 module=MLASelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=MLASelfAttentionSubmodules(
                     linear_q_proj=backend.column_parallel_linear(),
                     linear_q_down_proj=backend.column_parallel_linear(),
@@ -454,7 +462,7 @@ def get_gpt_layer_local_submodules(
             input_layernorm=layer_norm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
@@ -586,6 +594,7 @@ def get_gpt_decoder_layer_specs(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
+    attn_mask_type: AttnMaskType = AttnMaskType.causal,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     del vp_stage, pp_rank  # accepted for API compatibility with main-side callers
@@ -593,6 +602,8 @@ def get_gpt_decoder_layer_specs(
         "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
         f"but got {config.experimental_attention_variant=}."
     )
+
+    use_fa4 = config.attention_backend == AttnBackend.flash4
 
     if use_transformer_engine:
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -607,6 +618,8 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            attn_mask_type=attn_mask_type,
+            use_fa4=use_fa4,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -620,6 +633,8 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            attn_mask_type=attn_mask_type,
+            use_fa4=use_fa4,
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
@@ -627,6 +642,7 @@ def get_gpt_decoder_layer_specs(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             qk_l2_norm=qk_l2_norm,
+            attn_mask_type=attn_mask_type,
         )
         moe_layer_spec = get_gpt_layer_with_inference_spec(
             qk_layernorm=config.qk_layernorm,
@@ -634,6 +650,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
+            attn_mask_type=attn_mask_type,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(
@@ -645,6 +662,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             enable_hyper_connection=config.enable_hyper_connections,
+            attn_mask_type=attn_mask_type,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -655,6 +673,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             enable_hyper_connection=config.enable_hyper_connections,
+            attn_mask_type=attn_mask_type,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -697,10 +716,11 @@ def get_gpt_decoder_block_spec(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
+    attn_mask_type: AttnMaskType = AttnMaskType.causal,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     layer_specs = get_gpt_decoder_layer_specs(
-        config, use_transformer_engine, normalization, qk_l2_norm
+        config, use_transformer_engine, normalization, qk_l2_norm, attn_mask_type=attn_mask_type
     )
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.

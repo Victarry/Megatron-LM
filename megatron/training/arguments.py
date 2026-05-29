@@ -4151,6 +4151,17 @@ def _add_data_args(parser):
         dest='create_attention_mask_in_dataloader',
     )
     group.add_argument(
+        '--attention-mask-type',
+        type=str,
+        default='causal',
+        choices=['causal', 'no_mask', 'padding'],
+        help=(
+            'Type of attention mask: causal (default, GPT-style), '
+            'no_mask (full bidirectional, no masking), '
+            'padding (bidirectional with padding mask).'
+        ),
+    )
+    group.add_argument(
         '--num-dataset-builder-threads',
         type=int,
         default=1,

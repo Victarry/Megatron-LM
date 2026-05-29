@@ -297,6 +297,9 @@ def print_datetime(string, override_timestamp=None):
 
 
 def num_floating_point_operations(args, batch_size):
+    # Causal attention computes the lower triangle; no_mask computes the full matrix.
+    causal_factor = 1.0 if getattr(args, 'attention_mask_type', 'causal') == 'no_mask' else 0.5
+
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
@@ -354,7 +357,7 @@ def num_floating_point_operations(args, batch_size):
             * seq_len
             * hidden_size
             * p
-            * (hidden_size + (hidden_size * (g / num_heads)) + (seq_len / 2))
+            * (hidden_size + (hidden_size * (g / num_heads)) + (seq_len * causal_factor))
         )
 
     def mamba_layer_flops(
@@ -622,8 +625,11 @@ def num_floating_point_operations(args, batch_size):
                         ## core attn
                         + args.seq_length
                         * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                        / 2  # causal mask (only half of the mask is non-zero)
-                        + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                        * causal_factor
+                        + args.seq_length
+                        * args.num_attention_heads
+                        * args.v_head_dim
+                        * causal_factor
                     )
                 )
 
@@ -648,7 +654,7 @@ def num_floating_point_operations(args, batch_size):
                     ## core attention
                     + query_projection_size
                     * args.seq_length
-                    / 2  # causal mask (only half of the mask is non-zero)
+                    * causal_factor
                     * 2  # QK^T and (QK^T)V
                     ## out proj
                     + query_projection_size * args.hidden_size
