@@ -15,6 +15,7 @@
 import functools
 import importlib
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
@@ -586,6 +587,77 @@ class MegatronFSDP(torch.nn.Module):
                 if is_float8tensor(param):
                     fp8_discard_transpose_cache(param)
 
+        debug_shared_expert_stream = (
+            os.getenv("MCORE_DEBUG_FSDP_SHARED_EXPERT_STREAM", "0") == "1"
+        )
+        debug_shared_expert_wait = (
+            os.getenv("MCORE_DEBUG_FSDP_SHARED_EXPERT_WAIT", "0") == "1"
+        )
+        debug_shared_expert_log_all_ranks = (
+            os.getenv("MCORE_DEBUG_FSDP_SHARED_EXPERT_ALL_RANKS", "0") == "1"
+        )
+        debug_shared_expert_log_limit = int(
+            os.getenv("MCORE_DEBUG_FSDP_SHARED_EXPERT_LOG_LIMIT", "16")
+        )
+        debug_shared_expert_logged_params = set()
+
+        def _maybe_debug_shared_expert_grad_stream(param):
+            if not (debug_shared_expert_stream or debug_shared_expert_wait):
+                return
+
+            param_name = self.param_to_name.get(param, "")
+            if ".shared_experts." not in f".{param_name}.":
+                return
+
+            if not torch.cuda.is_available():
+                return
+
+            try:
+                from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+                shared_stream = SharedExpertMLP.stream
+            except Exception:
+                shared_stream = None
+
+            current_stream = torch.cuda.current_stream()
+            wait_inserted = debug_shared_expert_wait and shared_stream is not None
+            if wait_inserted:
+                current_stream.wait_stream(shared_stream)
+
+            if not debug_shared_expert_stream:
+                return
+
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            if rank != 0 and not debug_shared_expert_log_all_ranks:
+                return
+            if param_name in debug_shared_expert_logged_params:
+                return
+            if len(debug_shared_expert_logged_params) >= debug_shared_expert_log_limit:
+                return
+            debug_shared_expert_logged_params.add(param_name)
+
+            shared_stream_id = None if shared_stream is None else shared_stream.cuda_stream
+            shared_stream_device = None if shared_stream is None else str(shared_stream.device)
+            current_stream_id = current_stream.cuda_stream
+            current_stream_device = str(current_stream.device)
+            same_stream = (
+                shared_stream is not None
+                and current_stream_id == shared_stream_id
+                and current_stream_device == shared_stream_device
+            )
+            print(
+                "[MCORE_DEBUG][FSDP_SHARED_EXPERT_GRAD_STREAM] "
+                f"rank={rank} param={param_name} "
+                f"current_stream={current_stream_id} current_device={current_stream_device} "
+                f"shared_stream={shared_stream_id} shared_device={shared_stream_device} "
+                f"same_stream={same_stream} wait_inserted={wait_inserted} "
+                f"grad_added_to_main_grad={getattr(param, 'grad_added_to_main_grad', None)} "
+                f"has_grad={param.grad is not None}",
+                flush=True,
+            )
+
         def _grad_acc(param):
             """
             Accumulate the gradient in the main_grad buffer.
@@ -597,6 +669,8 @@ class MegatronFSDP(torch.nn.Module):
             group = self.param_and_grad_buffer.parameter_groups[group_id]
             if not group.requires_grad:
                 return
+
+            _maybe_debug_shared_expert_grad_stream(param)
 
             # Sharded Gradient Buffer
             gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
