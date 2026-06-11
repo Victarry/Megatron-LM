@@ -323,6 +323,39 @@ def _memory_phase_logging_enabled():
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _memory_op_first_use_logging_enabled():
+    value = os.environ.get("MCORE_LOG_MEMORY_OP_FIRST_USE", "")
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _memory_op_first_use_sync_enabled():
+    value = os.environ.get("MCORE_LOG_MEMORY_OP_FIRST_USE_SYNC", "1")
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _memory_op_first_use_backward_enabled():
+    value = os.environ.get("MCORE_LOG_MEMORY_OP_FIRST_USE_BACKWARD", "1")
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _memory_op_first_use_scope():
+    scope = os.environ.get("MCORE_LOG_MEMORY_OP_FIRST_USE_SCOPE", "category").lower()
+    if scope not in ("category", "module"):
+        return "category"
+    return scope
+
+
+_MEMORY_OP_FIRST_USE_STATE = {
+    "installed": False,
+    "seen": set(),
+    "handles": [],
+    "wrapped_methods": [],
+    "last_residual_mb": None,
+    "trace_start_residual_mb": None,
+    "context": {},
+}
+
+
 def _memory_report_sample(mega_bytes, include_device_memory_used):
     """Return memory report fields in MB."""
     sample = {
@@ -406,6 +439,281 @@ def report_memory_phase(label):
         string += _format_memory_report_sample(sample, include_outside_reserved_residual=True)
         print("[Rank {}] {}".format(sample["rank"], string), flush=True)
         print("MCORE_MEMORY_PHASE " + json.dumps(sample, sort_keys=True), flush=True)
+
+
+def _should_report_memory_op_first_use():
+    if not _memory_op_first_use_logging_enabled():
+        return False
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return mpu.get_data_parallel_rank() == 0
+    except Exception:
+        return False
+
+
+def _memory_op_first_use_key(stage, category, module_name):
+    if _memory_op_first_use_scope() == "module":
+        return (stage, module_name)
+    return (stage, category)
+
+
+def _memory_op_category(module_name, module_type):
+    name = module_name.lower()
+    module_type_lower = module_type.lower()
+
+    if "self_attention.linear_qkv" in name:
+        return "attention.linear_qkv"
+    if "self_attention.core_attention" in name or "dotproductattention" in module_type_lower:
+        return "attention.core_attention"
+    if "self_attention.linear_proj" in name:
+        return "attention.linear_proj"
+    if "self_attention" in name and "q_layernorm" in name:
+        return "attention.q_layernorm"
+    if "self_attention" in name and "k_layernorm" in name:
+        return "attention.k_layernorm"
+    if name.endswith("input_layernorm"):
+        return "layernorm.input"
+    if name.endswith("pre_mlp_layernorm"):
+        return "layernorm.pre_mlp"
+    if "layernorm" in module_type_lower or module_type_lower == "tenorm":
+        return "layernorm"
+
+    if ".mlp.router" in name or "router" in module_type_lower:
+        return "moe.router"
+    if ".mlp.shared_experts" in name:
+        return "moe.shared_experts"
+    if ".mlp.experts" in name or "groupedmlp" in module_type_lower:
+        return "moe.experts"
+    if "sequentialmlp" in module_type_lower:
+        return "moe.sequential_experts"
+    if "moelayer" in module_type_lower:
+        return "moe.layer"
+
+    if ".mlp.linear_fc1" in name:
+        return "mlp.linear_fc1"
+    if ".mlp.linear_fc2" in name:
+        return "mlp.linear_fc2"
+    if module_type_lower == "mlp":
+        return "mlp.block"
+
+    if "selfattention" in module_type_lower:
+        return "attention.block"
+    if "columnparallellinear" in module_type_lower:
+        return "linear.column_parallel"
+    if "rowparallellinear" in module_type_lower:
+        return "linear.row_parallel"
+
+    return None
+
+
+def _iter_first_tensor(value):
+    if torch.is_tensor(value):
+        if value.requires_grad:
+            yield value
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_first_tensor(item)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_first_tensor(item)
+
+
+def _report_memory_op_first_use(stage, category, module_name, module_type):
+    if not _should_report_memory_op_first_use():
+        return
+
+    state = _MEMORY_OP_FIRST_USE_STATE
+    key = _memory_op_first_use_key(stage, category, module_name)
+    if key in state["seen"]:
+        return
+    state["seen"].add(key)
+
+    if _memory_op_first_use_sync_enabled():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    mega_bytes = 1024.0 * 1024.0
+    sample = _memory_report_sample(mega_bytes, include_device_memory_used=True)
+    sample["event"] = stage
+    sample["category"] = category
+    sample["module_name"] = module_name
+    sample["module_type"] = module_type
+    sample["rank"] = torch.distributed.get_rank()
+    sample.update(state["context"])
+
+    residual = sample["outside_reserved_residual_mb"]
+    if residual is not None:
+        if state["trace_start_residual_mb"] is None:
+            state["trace_start_residual_mb"] = residual
+        if state["last_residual_mb"] is None:
+            sample["delta_from_previous_outside_reserved_residual_mb"] = 0.0
+        else:
+            sample["delta_from_previous_outside_reserved_residual_mb"] = round(
+                residual - state["last_residual_mb"], 2
+            )
+        sample["delta_from_trace_start_outside_reserved_residual_mb"] = round(
+            residual - state["trace_start_residual_mb"], 2
+        )
+        state["last_residual_mb"] = residual
+    else:
+        sample["delta_from_previous_outside_reserved_residual_mb"] = None
+        sample["delta_from_trace_start_outside_reserved_residual_mb"] = None
+
+    print("MCORE_MEMORY_OP_FIRST_USE " + json.dumps(sample, sort_keys=True), flush=True)
+
+
+def _register_memory_op_tensor_hook(tensor, stage, category, module_name, module_type):
+    key = _memory_op_first_use_key(stage, category, module_name)
+    if key in _MEMORY_OP_FIRST_USE_STATE["seen"]:
+        return
+
+    def hook(grad):
+        _report_memory_op_first_use(stage, category, module_name, module_type)
+        return grad
+
+    try:
+        tensor.register_hook(hook)
+    except Exception:
+        pass
+
+
+def _make_memory_op_forward_pre_hook(module_name, module_type, category):
+    def hook(module, inputs):
+        if not _should_report_memory_op_first_use():
+            return
+        _report_memory_op_first_use("forward_pre", category, module_name, module_type)
+        if _memory_op_first_use_backward_enabled():
+            for tensor in _iter_first_tensor(inputs):
+                _register_memory_op_tensor_hook(
+                    tensor, "backward_post", category, module_name, module_type
+                )
+                break
+
+    return hook
+
+
+def _make_memory_op_forward_hook(module_name, module_type, category):
+    def hook(module, inputs, output):
+        if not _should_report_memory_op_first_use():
+            return
+        _report_memory_op_first_use("forward_post", category, module_name, module_type)
+        if _memory_op_first_use_backward_enabled():
+            for tensor in _iter_first_tensor(output):
+                _register_memory_op_tensor_hook(
+                    tensor, "backward_pre", category, module_name, module_type
+                )
+                break
+
+    return hook
+
+
+def _wrap_memory_op_method(owner, method_name, category, qualified_name):
+    wrapped_methods = getattr(owner, "_mcore_memory_op_first_use_wrapped_methods", set())
+    if method_name in wrapped_methods:
+        return False
+
+    original = getattr(owner, method_name, None)
+    if not callable(original):
+        return False
+
+    module_type = owner.__class__.__name__
+
+    def wrapped(*args, **kwargs):
+        _report_memory_op_first_use("call_pre", category, qualified_name, module_type)
+        result = original(*args, **kwargs)
+        _report_memory_op_first_use("call_post", category, qualified_name, module_type)
+        return result
+
+    setattr(owner, method_name, wrapped)
+    wrapped_methods.add(method_name)
+    setattr(owner, "_mcore_memory_op_first_use_wrapped_methods", wrapped_methods)
+    _MEMORY_OP_FIRST_USE_STATE["wrapped_methods"].append(qualified_name)
+    return True
+
+
+def _install_memory_dispatcher_method_hooks(module_name, dispatcher):
+    for method_name in (
+        "dispatch_preprocess",
+        "token_dispatch",
+        "dispatch_postprocess",
+        "combine_preprocess",
+        "token_combine",
+        "combine_postprocess",
+    ):
+        _wrap_memory_op_method(
+            dispatcher,
+            method_name,
+            f"moe.dispatcher.{method_name}",
+            f"{module_name}.token_dispatcher.{method_name}",
+        )
+
+
+def set_memory_op_first_use_context(**context):
+    """Set optional context fields attached to first-use memory trace events."""
+    if not _memory_op_first_use_logging_enabled():
+        return
+    _MEMORY_OP_FIRST_USE_STATE["context"] = {
+        key: value for key, value in context.items() if value is not None
+    }
+
+
+def install_memory_op_first_use_hooks(model):
+    """Install gated first-use memory hooks on selected training ops/modules."""
+    if not _should_report_memory_op_first_use():
+        return
+
+    state = _MEMORY_OP_FIRST_USE_STATE
+    if state["installed"]:
+        return
+    state["installed"] = True
+
+    model_chunks = model if isinstance(model, list) else [model]
+    unwrapped_chunks = unwrap_model(model_chunks)
+    if not isinstance(unwrapped_chunks, list):
+        unwrapped_chunks = [unwrapped_chunks]
+
+    hooked_modules = 0
+    for chunk_idx, model_chunk in enumerate(unwrapped_chunks):
+        for module_name, module in model_chunk.named_modules():
+            qualified_name = f"model_chunk{chunk_idx}.{module_name}" if module_name else (
+                f"model_chunk{chunk_idx}"
+            )
+            module_type = module.__class__.__name__
+            category = _memory_op_category(module_name, module_type)
+            if category is not None:
+                state["handles"].append(
+                    module.register_forward_pre_hook(
+                        _make_memory_op_forward_pre_hook(qualified_name, module_type, category)
+                    )
+                )
+                state["handles"].append(
+                    module.register_forward_hook(
+                        _make_memory_op_forward_hook(qualified_name, module_type, category)
+                    )
+                )
+                hooked_modules += 1
+
+            dispatcher = getattr(module, "token_dispatcher", None)
+            if dispatcher is not None:
+                _install_memory_dispatcher_method_hooks(qualified_name, dispatcher)
+
+    if _should_report_memory_op_first_use():
+        sample = {
+            "rank": torch.distributed.get_rank(),
+            "hooked_modules": hooked_modules,
+            "wrapped_methods": len(state["wrapped_methods"]),
+            "scope": _memory_op_first_use_scope(),
+            "sync": _memory_op_first_use_sync_enabled(),
+            "backward": _memory_op_first_use_backward_enabled(),
+        }
+        print("MCORE_MEMORY_OP_TRACE_INSTALLED " + json.dumps(sample, sort_keys=True), flush=True)
 
 
 def print_params_min_max_norm(optimizer, iteration):

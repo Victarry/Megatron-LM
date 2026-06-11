@@ -268,6 +268,7 @@ from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
+    install_memory_op_first_use_hooks,
     is_last_rank,
     logical_and_across_model_parallel_group,
     print_rank_0,
@@ -275,6 +276,7 @@ from .utils import (
     reduce_max_stat_across_model_parallel_group,
     report_memory,
     report_memory_phase,
+    set_memory_op_first_use_context,
     to_empty_if_meta_device,
     unwrap_model,
     update_use_dist_ckpt,
@@ -2091,6 +2093,7 @@ def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_con
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     report_memory_phase("after_model_build")
+    install_memory_op_first_use_hooks(model)
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics(
@@ -2278,6 +2281,7 @@ def train_step(
     config,
     forward_backward_func,
     iteration=None,
+    memory_phase_label_prefix=None,
 ):
     """Single training step."""
     args = get_args()
@@ -2302,12 +2306,18 @@ def train_step(
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        set_memory_op_first_use_context(iteration=iteration)
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.before_zero_grad")
+
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.after_zero_grad")
 
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
@@ -2371,6 +2381,8 @@ def train_step(
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.before_forward_backward")
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -2383,6 +2395,8 @@ def train_step(
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
         )
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.after_forward_backward")
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2421,7 +2435,11 @@ def train_step(
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.before_empty_cache_level1")
         torch.cuda.empty_cache()
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.after_empty_cache_level1")
 
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -2431,7 +2449,11 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if memory_phase_label_prefix is not None:
+        report_memory_phase(f"{memory_phase_label_prefix}.before_optimizer_step")
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if memory_phase_label_prefix is not None:
+        report_memory_phase(f"{memory_phase_label_prefix}.after_optimizer_step")
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2469,7 +2491,11 @@ def train_step(
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.before_empty_cache_level2")
         torch.cuda.empty_cache()
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.after_empty_cache_level2")
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
@@ -3722,6 +3748,11 @@ def train(
                 config,
                 forward_backward_func,
                 iteration=iteration,
+                memory_phase_label_prefix=(
+                    f"train_step_{iteration - start_iteration + 1}"
+                    if iteration < start_iteration + 2
+                    else None
+                ),
             )
             if iteration < start_iteration + 2:
                 report_memory_phase(f"after_train_step_{iteration - start_iteration + 1}")
