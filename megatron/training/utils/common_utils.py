@@ -316,20 +316,95 @@ def _format_nccl_memory_stats(nccl_memory_stats, mega_bytes):
     return f" | nccl memory (MB): total: {total / mega_bytes:.2f}"
 
 
+def _memory_phase_logging_enabled():
+    value = os.environ.get("MCORE_LOG_MEMORY_PHASES", "")
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _memory_report_sample(mega_bytes, include_device_memory_used):
+    """Return memory report fields in MB."""
+    sample = {
+        "allocated_mb": round(torch.cuda.memory_allocated() / mega_bytes, 2),
+        "max_allocated_mb": round(torch.cuda.max_memory_allocated() / mega_bytes, 2),
+        "reserved_mb": round(torch.cuda.memory_reserved() / mega_bytes, 2),
+        "max_reserved_mb": round(torch.cuda.max_memory_reserved() / mega_bytes, 2),
+        "device_memory_used_mb": None,
+        "device_minus_reserved_mb": None,
+        "nccl_memory_status": "unavailable",
+        "nccl_memory_total_mb": None,
+        "outside_reserved_residual_mb": None,
+    }
+
+    if include_device_memory_used:
+        try:
+            device_memory_used_mb = torch.cuda.device_memory_used() / mega_bytes
+            sample["device_memory_used_mb"] = round(device_memory_used_mb, 2)
+            sample["device_minus_reserved_mb"] = round(
+                device_memory_used_mb - sample["reserved_mb"], 2
+            )
+        except Exception:
+            pass
+
+    nccl_memory_stats = _get_nccl_memory_stats()
+    if nccl_memory_stats and nccl_memory_stats.get("total") is not None:
+        nccl_memory_total_mb = nccl_memory_stats["total"] / mega_bytes
+        sample["nccl_memory_status"] = "available"
+        sample["nccl_memory_total_mb"] = round(nccl_memory_total_mb, 2)
+        if sample["device_memory_used_mb"] is not None:
+            sample["outside_reserved_residual_mb"] = round(
+                sample["device_memory_used_mb"]
+                - sample["reserved_mb"]
+                - sample["nccl_memory_total_mb"],
+                2,
+            )
+
+    return sample
+
+
+def _format_memory_report_sample(sample, include_outside_reserved_residual=False):
+    string = f" | allocated: {sample['allocated_mb']:.2f}"
+    string += f" | max allocated: {sample['max_allocated_mb']:.2f}"
+    string += f" | reserved: {sample['reserved_mb']:.2f}"
+    string += f" | max reserved: {sample['max_reserved_mb']:.2f}"
+    if sample["device_memory_used_mb"] is not None:
+        string += f" | total device memory used: {sample['device_memory_used_mb']:.2f}"
+    if sample["nccl_memory_total_mb"] is not None:
+        string += f" | nccl memory (MB): total: {sample['nccl_memory_total_mb']:.2f}"
+    if include_outside_reserved_residual and sample["outside_reserved_residual_mb"] is not None:
+        string += f" | outside reserved residual: {sample['outside_reserved_residual_mb']:.2f}"
+    return string
+
+
 def report_memory(name):
     """Simple GPU memory report."""
     args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
-    string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
-    string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
-    string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
-    string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if args.log_device_memory_used:
-        string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
-    string += _format_nccl_memory_stats(_get_nccl_memory_stats(), mega_bytes)
+    string += _format_memory_report_sample(
+        _memory_report_sample(mega_bytes, args.log_device_memory_used)
+    )
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
+
+
+def report_memory_phase(label):
+    """Report a gated structured memory sample for residual attribution."""
+    if not _memory_phase_logging_enabled():
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    if not torch.cuda.is_available():
+        return
+
+    mega_bytes = 1024.0 * 1024.0
+    sample = _memory_report_sample(mega_bytes, include_device_memory_used=True)
+    sample["label"] = label
+    sample["rank"] = torch.distributed.get_rank()
+    if mpu.get_data_parallel_rank() == 0:
+        string = f"(memory phase: {label}) memory (MB)"
+        string += _format_memory_report_sample(sample, include_outside_reserved_residual=True)
+        print("[Rank {}] {}".format(sample["rank"], string), flush=True)
+        print("MCORE_MEMORY_PHASE " + json.dumps(sample, sort_keys=True), flush=True)
 
 
 def print_params_min_max_norm(optimizer, iteration):

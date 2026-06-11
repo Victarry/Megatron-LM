@@ -23,6 +23,7 @@ from megatron.training.utils.common_utils import (
     print_rank_last,
     reduce_max_stat_across_model_parallel_group,
     report_memory,
+    report_memory_phase,
     to_empty_if_meta_device,
     unwrap_model,
     update_use_dist_ckpt,

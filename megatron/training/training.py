@@ -274,6 +274,7 @@ from .utils import (
     print_rank_last,
     reduce_max_stat_across_model_parallel_group,
     report_memory,
+    report_memory_phase,
     to_empty_if_meta_device,
     unwrap_model,
     update_use_dist_ckpt,
@@ -1179,6 +1180,7 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+    report_memory_phase("after_initialize_megatron")
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
@@ -2088,6 +2090,7 @@ def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_con
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
+    report_memory_phase("after_model_build")
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics(
@@ -2122,6 +2125,7 @@ def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_con
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+    report_memory_phase("after_optimizer_build")
 
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
@@ -2199,9 +2203,11 @@ def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_con
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+        report_memory_phase("after_checkpoint_load")
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+        report_memory_phase("after_checkpoint_load_skipped")
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
@@ -3419,6 +3425,7 @@ def train(
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
+    report_memory_phase("before_training")
 
     # GPU sniff test at start of training.
     if args.gpu_sniff_test_interval is not None:
@@ -3716,6 +3723,8 @@ def train(
                 forward_backward_func,
                 iteration=iteration,
             )
+            if iteration < start_iteration + 2:
+                report_memory_phase(f"after_train_step_{iteration - start_iteration + 1}")
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()
@@ -3988,6 +3997,8 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
+
+    report_memory_phase("before_shutdown")
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
