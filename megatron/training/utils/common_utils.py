@@ -277,43 +277,45 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
     return bool(input.item())
 
 
+_NCCL_MEMORY_STATS_MIN_TORCH_VERSION = "2.12.0a0"
+
+
 def _supports_nccl_memory_stats():
     """Return whether this PyTorch version may expose NCCL backend memory stats."""
     try:
-        return is_torch_min_version("2.12.0")
+        return is_torch_min_version(_NCCL_MEMORY_STATS_MIN_TORCH_VERSION)
     except Exception:
         return False
 
 
 def _get_nccl_memory_stats():
     """Return NCCL communicator memory stats in bytes, if the runtime exposes them."""
-    if not _supports_nccl_memory_stats():
-        return None
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return None
-    if not torch.cuda.is_available():
-        return None
+    if (
+        not _supports_nccl_memory_stats()
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+        or not torch.cuda.is_available()
+    ):
+        return {}
 
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         backend = torch.distributed.distributed_c10d._get_default_group()._get_backend(device)
-        if getattr(backend, "_get_backend_name", lambda: None)() != "nccl":
-            return None
-
-        return getattr(backend, "memory_stats", lambda: None)()
+        if getattr(backend, "_get_backend_name", lambda: None)() == "nccl":
+            memory_stats = getattr(backend, "memory_stats", None)
+            if callable(memory_stats):
+                return memory_stats() or {}
     except Exception:
-        return None
+        pass
+    return {}
 
 
-def _format_nccl_memory_stats(nccl_memory_stats, mega_bytes):
-    """Format NCCL total memory for appending to report_memory output."""
-    if not nccl_memory_stats:
-        return ""
-
-    total = nccl_memory_stats.get("total")
+def _get_nccl_memory_total_mb(mega_bytes):
+    """Return NCCL communicator memory total in MB, if available."""
+    total = _get_nccl_memory_stats().get("total")
     if total is None:
-        return ""
-    return f" | nccl memory (MB): total: {total / mega_bytes:.2f}"
+        return None
+    return round(total / mega_bytes, 2)
 
 
 def _memory_phase_logging_enabled():
@@ -345,11 +347,10 @@ def _memory_report_sample(mega_bytes, include_device_memory_used):
         except Exception:
             pass
 
-    nccl_memory_stats = _get_nccl_memory_stats()
-    if nccl_memory_stats and nccl_memory_stats.get("total") is not None:
-        nccl_memory_total_mb = nccl_memory_stats["total"] / mega_bytes
+    nccl_memory_total_mb = _get_nccl_memory_total_mb(mega_bytes)
+    if nccl_memory_total_mb is not None:
         sample["nccl_memory_status"] = "available"
-        sample["nccl_memory_total_mb"] = round(nccl_memory_total_mb, 2)
+        sample["nccl_memory_total_mb"] = nccl_memory_total_mb
         if sample["device_memory_used_mb"] is not None:
             sample["outside_reserved_residual_mb"] = round(
                 sample["device_memory_used_mb"]
