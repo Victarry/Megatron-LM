@@ -4,6 +4,8 @@
 import json
 import os
 import sys
+import threading
+import time
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
@@ -323,6 +325,11 @@ def _memory_phase_logging_enabled():
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _memory_phase_sync_enabled():
+    value = os.environ.get("MCORE_LOG_MEMORY_PHASE_SYNC", "0")
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 def _memory_op_first_use_logging_enabled():
     value = os.environ.get("MCORE_LOG_MEMORY_OP_FIRST_USE", "")
     return value.lower() in ("1", "true", "yes", "on")
@@ -354,6 +361,239 @@ _MEMORY_OP_FIRST_USE_STATE = {
     "trace_start_residual_mb": None,
     "context": {},
 }
+
+_CUDA_ALLOC_CONTEXT_TRACE_STATE = {
+    "initialized": False,
+    "enabled": False,
+    "rank": None,
+    "file": None,
+    "path": None,
+    "next_id": 0,
+    "seen": set(),
+    "lock": threading.Lock(),
+}
+_CUDA_ALLOC_CONTEXT_TRACE_LOCAL = threading.local()
+
+
+def _env_truthy(name, default=""):
+    value = os.environ.get(name, default)
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _trace_rank():
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+    except Exception:
+        pass
+    for name in ("RANK", "SLURM_PROCID"):
+        value = os.environ.get(name)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    return -1
+
+
+def _rank_filter_enabled(rank, value):
+    if value in (None, ""):
+        return rank <= 0
+    value = value.strip().lower()
+    if value in ("all", "*"):
+        return True
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            if int(item) == rank:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _context_trace_tid():
+    try:
+        return threading.get_native_id()
+    except AttributeError:
+        return threading.get_ident()
+
+
+def _context_trace_path(rank):
+    path_template = os.environ.get("MCORE_CUDA_ALLOC_CONTEXT_TRACE_PATH", "")
+    if path_template:
+        return path_template.replace("%r", str(rank)).replace("%p", str(os.getpid()))
+    trace_dir = os.environ.get("MCORE_CUDA_ALLOC_CONTEXT_TRACE_DIR", "/tmp")
+    return os.path.join(trace_dir, f"cuda_alloc_context_rank{rank}_pid{os.getpid()}.jsonl")
+
+
+def _init_cuda_alloc_context_trace():
+    state = _CUDA_ALLOC_CONTEXT_TRACE_STATE
+    if state["initialized"]:
+        return
+    state["initialized"] = True
+
+    if not _env_truthy("MCORE_CUDA_ALLOC_CONTEXT_TRACE"):
+        return
+    rank = _trace_rank()
+    if not _rank_filter_enabled(rank, os.environ.get("MCORE_CUDA_ALLOC_CONTEXT_TRACE_RANKS")):
+        return
+
+    path = _context_trace_path(rank)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        state["file"] = open(path, "a", buffering=1)
+    except Exception as exc:
+        print(
+            "MCORE_CUDA_ALLOC_CONTEXT_TRACE_ERROR "
+            + json.dumps({"rank": rank, "path": path, "error": str(exc)}, sort_keys=True),
+            flush=True,
+        )
+        return
+
+    state["rank"] = rank
+    state["path"] = path
+    state["enabled"] = True
+    print(
+        "MCORE_CUDA_ALLOC_CONTEXT_TRACE_READY "
+        + json.dumps({"rank": rank, "path": path}, sort_keys=True),
+        flush=True,
+    )
+
+
+def _cuda_alloc_context_trace_enabled():
+    _init_cuda_alloc_context_trace()
+    return _CUDA_ALLOC_CONTEXT_TRACE_STATE["enabled"]
+
+
+def _cuda_alloc_context_stack():
+    stack = getattr(_CUDA_ALLOC_CONTEXT_TRACE_LOCAL, "stack", None)
+    if stack is None:
+        stack = []
+        _CUDA_ALLOC_CONTEXT_TRACE_LOCAL.stack = stack
+    return stack
+
+
+def _write_cuda_alloc_context_event(
+    event,
+    op_category,
+    name,
+    module_path=None,
+    iteration=None,
+    context_id=None,
+    parent_context_id=None,
+    first_invocation=False,
+    **metadata,
+):
+    if not _cuda_alloc_context_trace_enabled():
+        return
+
+    state = _CUDA_ALLOC_CONTEXT_TRACE_STATE
+    payload = {
+        "record_type": "context",
+        "rank": state["rank"],
+        "pid": os.getpid(),
+        "tid": _context_trace_tid(),
+        "timestamp_ns": time.monotonic_ns(),
+        "event": event,
+        "op_category": op_category,
+        "name": name,
+        "context_id": context_id,
+        "parent_context_id": parent_context_id,
+        "first_invocation": bool(first_invocation),
+    }
+    if module_path is not None:
+        payload["module_path"] = module_path
+    if iteration is not None:
+        try:
+            payload["iteration"] = int(iteration)
+        except (TypeError, ValueError):
+            payload["iteration_label"] = str(iteration)
+    for key, value in metadata.items():
+        if value is not None:
+            payload[key] = value
+
+    with state["lock"]:
+        state["file"].write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _enter_cuda_allocation_context(op_category, name, module_path=None, iteration=None, **metadata):
+    if not _cuda_alloc_context_trace_enabled():
+        return None
+
+    state = _CUDA_ALLOC_CONTEXT_TRACE_STATE
+    stack = _cuda_alloc_context_stack()
+    parent_context_id = stack[-1]["context_id"] if stack else None
+    with state["lock"]:
+        state["next_id"] += 1
+        context_id = f"{state['rank']}:{os.getpid()}:{state['next_id']}"
+        first_key = (op_category, name)
+        first_invocation = first_key not in state["seen"]
+        state["seen"].add(first_key)
+
+    frame = {
+        "context_id": context_id,
+        "op_category": op_category,
+        "name": name,
+    }
+    stack.append(frame)
+    _write_cuda_alloc_context_event(
+        "enter",
+        op_category,
+        name,
+        module_path=module_path,
+        iteration=iteration,
+        context_id=context_id,
+        parent_context_id=parent_context_id,
+        first_invocation=first_invocation,
+        **metadata,
+    )
+    return frame
+
+
+def _exit_cuda_allocation_context(frame, module_path=None, iteration=None, **metadata):
+    if frame is None:
+        return
+    stack = _cuda_alloc_context_stack()
+    if stack and stack[-1]["context_id"] == frame["context_id"]:
+        stack.pop()
+    elif frame in stack:
+        stack.remove(frame)
+        metadata["stack_mismatch"] = True
+    else:
+        metadata["stack_mismatch"] = True
+    _write_cuda_alloc_context_event(
+        "exit",
+        frame["op_category"],
+        frame["name"],
+        module_path=module_path,
+        iteration=iteration,
+        context_id=frame["context_id"],
+        first_invocation=False,
+        **metadata,
+    )
+
+
+@contextmanager
+def cuda_allocation_context(op_category, name, module_path=None, iteration=None, **metadata):
+    """Emit a gated Megatron operation context for CUDA allocation attribution."""
+    frame = _enter_cuda_allocation_context(
+        op_category,
+        name,
+        module_path=module_path,
+        iteration=iteration,
+        **metadata,
+    )
+    try:
+        yield
+    finally:
+        _exit_cuda_allocation_context(
+            frame,
+            module_path=module_path,
+            iteration=iteration,
+        )
 
 
 def _memory_report_sample(mega_bytes, include_device_memory_used):
@@ -430,10 +670,18 @@ def report_memory_phase(label):
     if not torch.cuda.is_available():
         return
 
+    synchronized = _memory_phase_sync_enabled()
+    if synchronized:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
     mega_bytes = 1024.0 * 1024.0
     sample = _memory_report_sample(mega_bytes, include_device_memory_used=True)
     sample["label"] = label
     sample["rank"] = torch.distributed.get_rank()
+    sample["synchronized"] = synchronized
     if mpu.get_data_parallel_rank() == 0:
         string = f"(memory phase: {label}) memory (MB)"
         string += _format_memory_report_sample(sample, include_outside_reserved_residual=True)
@@ -452,6 +700,10 @@ def _should_report_memory_op_first_use():
         return mpu.get_data_parallel_rank() == 0
     except Exception:
         return False
+
+
+def _should_trace_memory_ops():
+    return _should_report_memory_op_first_use() or _cuda_alloc_context_trace_enabled()
 
 
 def _memory_op_first_use_key(stage, category, module_name):
@@ -533,7 +785,8 @@ def _report_memory_op_first_use(stage, category, module_name, module_type):
         return
     state["seen"].add(key)
 
-    if _memory_op_first_use_sync_enabled():
+    synchronized = _memory_op_first_use_sync_enabled()
+    if synchronized:
         try:
             torch.cuda.synchronize()
         except Exception:
@@ -546,6 +799,7 @@ def _report_memory_op_first_use(stage, category, module_name, module_type):
     sample["module_name"] = module_name
     sample["module_type"] = module_type
     sample["rank"] = torch.distributed.get_rank()
+    sample["synchronized"] = synchronized
     sample.update(state["context"])
 
     residual = sample["outside_reserved_residual_mb"]
@@ -586,10 +840,24 @@ def _register_memory_op_tensor_hook(tensor, stage, category, module_name, module
 
 def _make_memory_op_forward_pre_hook(module_name, module_type, category):
     def hook(module, inputs):
-        if not _should_report_memory_op_first_use():
+        should_report = _should_report_memory_op_first_use()
+        if not should_report and not _cuda_alloc_context_trace_enabled():
             return
-        _report_memory_op_first_use("forward_pre", category, module_name, module_type)
-        if _memory_op_first_use_backward_enabled():
+        iteration = _MEMORY_OP_FIRST_USE_STATE["context"].get("iteration")
+        frame = _enter_cuda_allocation_context(
+            category,
+            module_name,
+            module_path=module_name,
+            iteration=iteration,
+            stage="forward",
+            module_type=module_type,
+        )
+        frames = getattr(module, "_mcore_cuda_alloc_context_frames", [])
+        frames.append(frame)
+        setattr(module, "_mcore_cuda_alloc_context_frames", frames)
+        if should_report:
+            _report_memory_op_first_use("forward_pre", category, module_name, module_type)
+        if should_report and _memory_op_first_use_backward_enabled():
             for tensor in _iter_first_tensor(inputs):
                 _register_memory_op_tensor_hook(
                     tensor, "backward_post", category, module_name, module_type
@@ -601,15 +869,27 @@ def _make_memory_op_forward_pre_hook(module_name, module_type, category):
 
 def _make_memory_op_forward_hook(module_name, module_type, category):
     def hook(module, inputs, output):
-        if not _should_report_memory_op_first_use():
+        should_report = _should_report_memory_op_first_use()
+        if not should_report and not _cuda_alloc_context_trace_enabled():
             return
-        _report_memory_op_first_use("forward_post", category, module_name, module_type)
-        if _memory_op_first_use_backward_enabled():
+        if should_report:
+            _report_memory_op_first_use("forward_post", category, module_name, module_type)
+        if should_report and _memory_op_first_use_backward_enabled():
             for tensor in _iter_first_tensor(output):
                 _register_memory_op_tensor_hook(
                     tensor, "backward_pre", category, module_name, module_type
                 )
                 break
+        frames = getattr(module, "_mcore_cuda_alloc_context_frames", [])
+        frame = frames.pop() if frames else None
+        iteration = _MEMORY_OP_FIRST_USE_STATE["context"].get("iteration")
+        _exit_cuda_allocation_context(
+            frame,
+            module_path=module_name,
+            iteration=iteration,
+            stage="forward",
+            module_type=module_type,
+        )
 
     return hook
 
@@ -626,9 +906,19 @@ def _wrap_memory_op_method(owner, method_name, category, qualified_name):
     module_type = owner.__class__.__name__
 
     def wrapped(*args, **kwargs):
-        _report_memory_op_first_use("call_pre", category, qualified_name, module_type)
-        result = original(*args, **kwargs)
-        _report_memory_op_first_use("call_post", category, qualified_name, module_type)
+        iteration = _MEMORY_OP_FIRST_USE_STATE["context"].get("iteration")
+        with cuda_allocation_context(
+            category,
+            qualified_name,
+            module_path=qualified_name,
+            iteration=iteration,
+            stage="call",
+            module_type=module_type,
+            method_name=method_name,
+        ):
+            _report_memory_op_first_use("call_pre", category, qualified_name, module_type)
+            result = original(*args, **kwargs)
+            _report_memory_op_first_use("call_post", category, qualified_name, module_type)
         return result
 
     setattr(owner, method_name, wrapped)
@@ -657,7 +947,7 @@ def _install_memory_dispatcher_method_hooks(module_name, dispatcher):
 
 def set_memory_op_first_use_context(**context):
     """Set optional context fields attached to first-use memory trace events."""
-    if not _memory_op_first_use_logging_enabled():
+    if not _memory_op_first_use_logging_enabled() and not _cuda_alloc_context_trace_enabled():
         return
     _MEMORY_OP_FIRST_USE_STATE["context"] = {
         key: value for key, value in context.items() if value is not None
@@ -666,7 +956,7 @@ def set_memory_op_first_use_context(**context):
 
 def install_memory_op_first_use_hooks(model):
     """Install gated first-use memory hooks on selected training ops/modules."""
-    if not _should_report_memory_op_first_use():
+    if not _should_trace_memory_ops():
         return
 
     state = _MEMORY_OP_FIRST_USE_STATE
@@ -704,7 +994,7 @@ def install_memory_op_first_use_hooks(model):
             if dispatcher is not None:
                 _install_memory_dispatcher_method_hooks(qualified_name, dispatcher)
 
-    if _should_report_memory_op_first_use():
+    if _should_trace_memory_ops():
         sample = {
             "rank": torch.distributed.get_rank(),
             "hooked_modules": hooked_modules,

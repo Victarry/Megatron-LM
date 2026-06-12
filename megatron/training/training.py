@@ -268,6 +268,7 @@ from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
+    cuda_allocation_context,
     install_memory_op_first_use_hooks,
     is_last_rank,
     logical_and_across_model_parallel_group,
@@ -2286,6 +2287,9 @@ def train_step(
     """Single training step."""
     args = get_args()
     timers = get_timers()
+    context_label = memory_phase_label_prefix or (
+        f"train_step_{iteration}" if iteration is not None else "train_step"
+    )
 
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (
@@ -2311,11 +2315,16 @@ def train_step(
             report_memory_phase(f"{memory_phase_label_prefix}.before_zero_grad")
 
         # Set grad to zero.
-        for model_chunk in model:
-            model_chunk.zero_grad_buffer()
-            # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
-            model_chunk.force_all_reduce = save_wgrads_in_this_iteration
-        optimizer.zero_grad()
+        with cuda_allocation_context(
+            "training.zero_grad",
+            f"{context_label}.zero_grad",
+            iteration=iteration,
+        ):
+            for model_chunk in model:
+                model_chunk.zero_grad_buffer()
+                # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
+                model_chunk.force_all_reduce = save_wgrads_in_this_iteration
+            optimizer.zero_grad()
         if memory_phase_label_prefix is not None:
             report_memory_phase(f"{memory_phase_label_prefix}.after_zero_grad")
 
@@ -2383,18 +2392,23 @@ def train_step(
             enable_dgrad_logging(model, args.save)
         if memory_phase_label_prefix is not None:
             report_memory_phase(f"{memory_phase_label_prefix}.before_forward_backward")
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
-        )
+        with cuda_allocation_context(
+            "training.forward_backward",
+            f"{context_label}.forward_backward",
+            iteration=iteration,
+        ):
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+            )
         if memory_phase_label_prefix is not None:
             report_memory_phase(f"{memory_phase_label_prefix}.after_forward_backward")
         if save_activations_in_this_iteration:
@@ -2451,7 +2465,12 @@ def train_step(
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if memory_phase_label_prefix is not None:
         report_memory_phase(f"{memory_phase_label_prefix}.before_optimizer_step")
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    with cuda_allocation_context(
+        "training.optimizer_step",
+        f"{context_label}.optimizer_step",
+        iteration=iteration,
+    ):
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if memory_phase_label_prefix is not None:
         report_memory_phase(f"{memory_phase_label_prefix}.after_optimizer_step")
 
@@ -3730,30 +3749,37 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
-            (
-                loss_dict,
-                skipped_iter,
-                should_checkpoint,
-                should_exit,
-                exit_code,
-                grad_norm,
-                num_zeros_in_grad,
-                max_attention_logit,
-            ) = train_step(
-                forward_step_func,
-                train_data_iterator,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                config,
-                forward_backward_func,
-                iteration=iteration,
-                memory_phase_label_prefix=(
-                    f"train_step_{iteration - start_iteration + 1}"
-                    if iteration < start_iteration + 2
-                    else None
-                ),
+            memory_phase_label = (
+                f"train_step_{iteration - start_iteration + 1}"
+                if iteration < start_iteration + 2
+                else None
             )
+            train_step_context_name = memory_phase_label or f"train_step_{iteration + 1}"
+            with cuda_allocation_context(
+                "training.train_step",
+                train_step_context_name,
+                iteration=iteration,
+            ):
+                (
+                    loss_dict,
+                    skipped_iter,
+                    should_checkpoint,
+                    should_exit,
+                    exit_code,
+                    grad_norm,
+                    num_zeros_in_grad,
+                    max_attention_logit,
+                ) = train_step(
+                    forward_step_func,
+                    train_data_iterator,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    config,
+                    forward_backward_func,
+                    iteration=iteration,
+                    memory_phase_label_prefix=memory_phase_label,
+                )
             if iteration < start_iteration + 2:
                 report_memory_phase(f"after_train_step_{iteration - start_iteration + 1}")
             ft_integration.on_training_step_end()

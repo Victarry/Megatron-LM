@@ -5,6 +5,7 @@ from megatron.training.utils.common_utils import (
     calc_dtensor_params_l2_norm,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
+    cuda_allocation_context,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
