@@ -2479,8 +2479,12 @@ def train_step(
     log_max_attention_logit = 0
     if args.qk_clip or args.log_max_attention_logit:
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+    if memory_phase_label_prefix is not None:
+        report_memory_phase(f"{memory_phase_label_prefix}.after_clip_qk")
 
     timers('optimizer').stop()
+    if memory_phase_label_prefix is not None:
+        report_memory_phase(f"{memory_phase_label_prefix}.after_optimizer_timer_stop")
 
     # Checkpoint params with parameter names.
     if save_params_in_this_iteration:
@@ -2494,6 +2498,8 @@ def train_step(
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
+    if memory_phase_label_prefix is not None:
+        report_memory_phase(f"{memory_phase_label_prefix}.after_optimizer_stat_reductions")
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -2507,6 +2513,8 @@ def train_step(
         skipped_iter = 0
     else:
         skipped_iter = 1
+    if memory_phase_label_prefix is not None:
+        report_memory_phase(f"{memory_phase_label_prefix}.after_lr_scheduler")
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
@@ -2520,6 +2528,8 @@ def train_step(
         # Average loss across microbatches.
         loss_reduced = {}
 
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.before_loss_reduce")
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
@@ -2536,6 +2546,8 @@ def train_step(
                 loss_reduced[key] = val
             else:
                 raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+        if memory_phase_label_prefix is not None:
+            report_memory_phase(f"{memory_phase_label_prefix}.after_loss_reduce")
         return (
             loss_reduced,
             skipped_iter,
@@ -3737,6 +3749,7 @@ def train(
                 # we use previously-generated data for an update.
                 buffered_rollouts = train_data_iterator
 
+        tail_memory_label = None
         if args.skip_train:
             # RL inference-only mode: skip gradient updates, just collect rollouts.
             loss_dict = {}
@@ -3782,7 +3795,14 @@ def train(
                 )
             if iteration < start_iteration + 2:
                 report_memory_phase(f"after_train_step_{iteration - start_iteration + 1}")
+            tail_memory_label = (
+                f"train_loop_tail_{iteration - start_iteration + 1}"
+                if iteration < start_iteration + 2
+                else None
+            )
             ft_integration.on_training_step_end()
+            if tail_memory_label is not None:
+                report_memory_phase(f"{tail_memory_label}.after_ft_end")
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()
             # Fault delay timing can start at the end of iteration N. Self-firing faults
@@ -3834,6 +3854,8 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+        if tail_memory_label is not None:
+            report_memory_phase(f"{tail_memory_label}.after_iteration_increment")
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
@@ -3893,8 +3915,12 @@ def train(
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
+        if tail_memory_label is not None:
+            report_memory_phase(f"{tail_memory_label}.after_iteration_accounting")
 
         # Logging.
+        if tail_memory_label is not None:
+            report_memory_phase(f"{tail_memory_label}.before_logging_inputs")
         if optimizer is not None and not optimizer.is_stub_optimizer:
             loss_scale = optimizer.get_loss_scale().item()
         else:
@@ -3902,28 +3928,48 @@ def train(
         params_norm = None
 
         if args.log_params_norm:
-            params_norm = calc_params_l2_norm(model)
+            with cuda_allocation_context(
+                "training.calc_params_l2_norm",
+                f"{tail_memory_label}.calc_params_l2_norm"
+                if tail_memory_label is not None
+                else f"iteration_{iteration}.calc_params_l2_norm",
+                iteration=iteration,
+            ):
+                params_norm = calc_params_l2_norm(model)
+            if tail_memory_label is not None:
+                report_memory_phase(f"{tail_memory_label}.after_calc_params_l2_norm")
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
             learning_rate = None
-        report_memory_flag = training_log(
-            loss_dict,
-            total_loss_dict,
-            learning_rate,
-            iteration,
-            loss_scale,
-            report_memory_flag,
-            skipped_iter,
-            grad_norm,
-            params_norm,
-            num_zeros_in_grad,
-            max_attention_logit,
-            pg_collection=model_pg_collection,
-            is_first_iteration=is_first_iteration,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-        )
+        if tail_memory_label is not None:
+            report_memory_phase(f"{tail_memory_label}.before_training_log")
+        with cuda_allocation_context(
+            "training.training_log",
+            f"{tail_memory_label}.training_log"
+            if tail_memory_label is not None
+            else f"iteration_{iteration}.training_log",
+            iteration=iteration,
+        ):
+            report_memory_flag = training_log(
+                loss_dict,
+                total_loss_dict,
+                learning_rate,
+                iteration,
+                loss_scale,
+                report_memory_flag,
+                skipped_iter,
+                grad_norm,
+                params_norm,
+                num_zeros_in_grad,
+                max_attention_logit,
+                pg_collection=model_pg_collection,
+                is_first_iteration=is_first_iteration,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+            )
+        if tail_memory_label is not None:
+            report_memory_phase(f"{tail_memory_label}.after_training_log")
         is_first_iteration = False
 
         # Evaluation.
@@ -4001,26 +4047,44 @@ def train(
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
         # (it is reset inside the callback after logging).
-        num_floating_point_operations_since_last_log_event = post_training_step_callbacks(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            iteration,
-            prof,
-            num_floating_point_operations_since_last_log_event,
-            nsys_nvtx_context,
-        )
+        with cuda_allocation_context(
+            "training.post_training_step_callbacks",
+            f"{tail_memory_label}.post_training_step_callbacks"
+            if tail_memory_label is not None
+            else f"iteration_{iteration}.post_training_step_callbacks",
+            iteration=iteration,
+        ):
+            num_floating_point_operations_since_last_log_event = post_training_step_callbacks(
+                model,
+                optimizer,
+                opt_param_scheduler,
+                iteration,
+                prof,
+                num_floating_point_operations_since_last_log_event,
+                nsys_nvtx_context,
+            )
+        if tail_memory_label is not None:
+            report_memory_phase(f"{tail_memory_label}.after_post_training_callbacks")
 
         # Checkpoint and decide whether to exit.
-        should_exit = checkpoint_and_decide_exit(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            iteration,
-            num_floating_point_operations_so_far,
-            checkpointing_context,
-            train_data_iterator,
-        )
+        with cuda_allocation_context(
+            "training.checkpoint_and_decide_exit",
+            f"{tail_memory_label}.checkpoint_and_decide_exit"
+            if tail_memory_label is not None
+            else f"iteration_{iteration}.checkpoint_and_decide_exit",
+            iteration=iteration,
+        ):
+            should_exit = checkpoint_and_decide_exit(
+                model,
+                optimizer,
+                opt_param_scheduler,
+                iteration,
+                num_floating_point_operations_so_far,
+                checkpointing_context,
+                train_data_iterator,
+            )
+        if tail_memory_label is not None:
+            report_memory_phase(f"{tail_memory_label}.after_checkpoint_decide_exit")
         if should_exit:
             break
 
