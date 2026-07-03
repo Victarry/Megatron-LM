@@ -175,6 +175,13 @@ class TEGroupedMLP(MegatronModule):
     Executes multiple experts in parallel to maximize computational efficiency.
     """
 
+    @staticmethod
+    def _builder_accepts_name(builder) -> bool:
+        try:
+            return "name" in inspect.signature(builder).parameters
+        except (TypeError, ValueError):
+            return False
+
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
     def __init__(
         self,
@@ -203,18 +210,22 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
+        linear_fc1_kwargs = {
+            "config": self.config,
+            "init_method": not_none(self.config.init_method),
+            "bias": self.config.add_bias_linear,
+            "skip_bias_add": False,
+            "is_expert": True,
+            "tp_comm_buffer_name": 'fc1',
+            "pg_collection": pg_collection,
+        }
+        if self._builder_accepts_name(submodules.linear_fc1):
+            linear_fc1_kwargs["name"] = (name + ".linear_fc1") if name is not None else None
         self.linear_fc1 = submodules.linear_fc1(
             self.num_local_experts,
             self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
             ffn_hidden_size,
-            config=self.config,
-            init_method=not_none(self.config.init_method),
-            bias=self.config.add_bias_linear,
-            skip_bias_add=False,
-            is_expert=True,
-            tp_comm_buffer_name='fc1',
-            pg_collection=pg_collection,
-            name=(name + ".linear_fc1") if name is not None else None,
+            **linear_fc1_kwargs,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -222,6 +233,17 @@ class TEGroupedMLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        linear_fc2_kwargs = {
+            "config": self.config,
+            "init_method": not_none(self.config.output_layer_init_method),
+            "bias": self.config.add_bias_linear,
+            "skip_bias_add": True,
+            "is_expert": True,
+            "tp_comm_buffer_name": 'fc2',
+            "pg_collection": pg_collection,
+        }
+        if self._builder_accepts_name(submodules.linear_fc2):
+            linear_fc2_kwargs["name"] = (name + ".linear_fc2") if name is not None else None
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,
             not_none(self.config.moe_ffn_hidden_size),
@@ -230,15 +252,12 @@ class TEGroupedMLP(MegatronModule):
                 if self.config.moe_latent_size is None
                 else self.config.moe_latent_size
             ),
-            config=self.config,
-            init_method=not_none(self.config.output_layer_init_method),
-            bias=self.config.add_bias_linear,
-            skip_bias_add=True,
-            is_expert=True,
-            tp_comm_buffer_name='fc2',
-            pg_collection=pg_collection,
-            name=(name + ".linear_fc2") if name is not None else None,
+            **linear_fc2_kwargs,
         )
+        if hasattr(self.linear_fc1, "weight0"):
+            self.fc1_weight_shape = self.linear_fc1.weight0.shape
+        if hasattr(self.linear_fc2, "weight0"):
+            self.fc2_weight_shape = self.linear_fc2.weight0.shape
 
         self.offload_expert_fc1 = (
             self.config.fine_grained_activation_offloading
@@ -932,6 +951,67 @@ class TEGroupedMLP(MegatronModule):
             sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
         return sharded_state_dict
 
+    def _get_expert_layer(self, module: str):
+        if module == "fc1":
+            return self.linear_fc1
+        if module == "fc2":
+            return self.linear_fc2
+        raise ValueError(f"Invalid expert module: {module}")
+
+    @staticmethod
+    def _assert_per_expert_grouped_weights(expert_layer) -> None:
+        if getattr(expert_layer, "single_grouped_weight", False):
+            raise NotImplementedError(
+                "BalancedMoELayer runtime expert hooks require moe_single_grouped_weight=False."
+            )
+
+    def free_expert_parameters(self, expert_indices: list[int]) -> None:
+        """Remove runtime spare experts from the optimizer-owned parameter set."""
+
+        for expert_layer in (self.linear_fc1, self.linear_fc2):
+            self._assert_per_expert_grouped_weights(expert_layer)
+            for expert_index in expert_indices:
+                for prefix in ("weight", "bias"):
+                    name = f"{prefix}{expert_index}"
+                    if name in expert_layer._parameters:
+                        delattr(expert_layer, name)
+
+    def get_expert_weights(self, module: str, expert_indices: list[int]) -> list[torch.Tensor]:
+        """Return the selected local expert weights for an fc1/fc2 module."""
+
+        expert_layer = self._get_expert_layer(module)
+        self._assert_per_expert_grouped_weights(expert_layer)
+        return [getattr(expert_layer, f"weight{expert_index}") for expert_index in expert_indices]
+
+    def set_expert_weights(
+        self,
+        module: str,
+        expert_weights: list[torch.Tensor],
+        expert_indices: list[int],
+    ) -> None:
+        """Attach dispatched runtime weights to local spare expert slots."""
+
+        if len(expert_weights) != len(expert_indices):
+            raise ValueError(
+                f"Expected {len(expert_indices)} weights for {module}, got {len(expert_weights)}."
+            )
+
+        expert_layer = self._get_expert_layer(module)
+        self._assert_per_expert_grouped_weights(expert_layer)
+        expected_shape = self.fc1_weight_shape if module == "fc1" else self.fc2_weight_shape
+        for expert_weight, expert_index in zip(expert_weights, expert_indices):
+            if expert_weight.shape != expected_shape:
+                raise ValueError(
+                    f"Expected {module} expert weight shape {tuple(expected_shape)}, "
+                    f"got {tuple(expert_weight.shape)}."
+                )
+            name = f"weight{expert_index}"
+            if name in expert_layer._parameters:
+                delattr(expert_layer, name)
+            setattr(expert_layer, name, expert_weight)
+
+        self._fused_ops = None
+
     def backward_dw(self):
         """Performs backward pass for weight gradients in TEGroupedMLP.
 
@@ -1269,16 +1349,23 @@ class SequentialMLP(MegatronModule):
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
 
+        mlp_init_params = inspect.signature(MLP.__init__).parameters
         for expert_idx in range(self.num_local_experts):
-            expert = MLP(
-                self.config,
-                submodules,
-                ffn_hidden_size=self.config.moe_ffn_hidden_size,
-                is_expert=True,
-                tp_group=pg_collection.expt_tp,
-                name=(name + f".local_experts.{expert_idx}") if name is not None else None,
-            )
+            expert_kwargs = {
+                "ffn_hidden_size": self.config.moe_ffn_hidden_size,
+                "is_expert": True,
+                "tp_group": pg_collection.expt_tp,
+            }
+            if "name" in mlp_init_params:
+                expert_kwargs["name"] = (
+                    name + f".local_experts.{expert_idx}" if name is not None else None
+                )
+            expert = MLP(self.config, submodules, **expert_kwargs)
             self.local_experts.append(expert)
+
+        if self.num_local_experts > 0:
+            self.fc1_weight_shape = self.local_experts[0].linear_fc1.weight.shape
+            self.fc2_weight_shape = self.local_experts[0].linear_fc2.weight.shape
 
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
@@ -1395,3 +1482,61 @@ class SequentialMLP(MegatronModule):
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
+
+    def free_expert_parameters(self, expert_indices: list[int]) -> None:
+        """Remove runtime spare experts from the optimizer-owned parameter set."""
+
+        for expert_index in expert_indices:
+            expert = self.local_experts[expert_index]
+            for layer_name in ("linear_fc1", "linear_fc2"):
+                layer = getattr(expert, layer_name)
+                for parameter_name in list(layer._parameters.keys()):
+                    if getattr(layer, parameter_name) is not None:
+                        delattr(layer, parameter_name)
+
+    def get_expert_weights(self, module: str, expert_indices: list[int]) -> list[torch.Tensor]:
+        """Return the selected local expert weights for an fc1/fc2 module."""
+
+        if module == "fc1":
+            expert_layer_name = "linear_fc1"
+        elif module == "fc2":
+            expert_layer_name = "linear_fc2"
+        else:
+            raise ValueError(f"Invalid expert module: {module}")
+
+        return [
+            getattr(self.local_experts[expert_index], expert_layer_name).weight
+            for expert_index in expert_indices
+        ]
+
+    def set_expert_weights(
+        self,
+        module: str,
+        expert_weights: list[torch.Tensor],
+        expert_indices: list[int],
+    ) -> None:
+        """Attach dispatched runtime weights to local spare expert slots."""
+
+        if len(expert_weights) != len(expert_indices):
+            raise ValueError(
+                f"Expected {len(expert_indices)} weights for {module}, got {len(expert_weights)}."
+            )
+        if module == "fc1":
+            expert_layer_name = "linear_fc1"
+            expected_shape = self.fc1_weight_shape
+        elif module == "fc2":
+            expert_layer_name = "linear_fc2"
+            expected_shape = self.fc2_weight_shape
+        else:
+            raise ValueError(f"Invalid expert module: {module}")
+
+        for expert_weight, expert_index in zip(expert_weights, expert_indices):
+            if expert_weight.shape != expected_shape:
+                raise ValueError(
+                    f"Expected {module} expert weight shape {tuple(expected_shape)}, "
+                    f"got {tuple(expert_weight.shape)}."
+                )
+            layer = getattr(self.local_experts[expert_index], expert_layer_name)
+            if "weight" in layer._parameters:
+                delattr(layer, "weight")
+            layer.weight = expert_weight
