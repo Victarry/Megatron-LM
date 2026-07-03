@@ -976,6 +976,13 @@ class TEGroupedMLP(MegatronModule):
                     if name in expert_layer._parameters:
                         delattr(expert_layer, name)
 
+    def disable_runtime_weight_main_grad_accumulation(self) -> None:
+        """Route runtime spare-weight gradients through autograd instead of ``main_grad``."""
+
+        for expert_layer in (self.linear_fc1, self.linear_fc2):
+            if hasattr(expert_layer, "fuse_wgrad_accumulation"):
+                expert_layer.fuse_wgrad_accumulation = False
+
     def get_expert_weights(self, module: str, expert_indices: list[int]) -> list[torch.Tensor]:
         """Return the selected local expert weights for an fc1/fc2 module."""
 

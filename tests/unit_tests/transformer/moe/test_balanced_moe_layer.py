@@ -483,3 +483,38 @@ def test_balanced_moe_layer_te_grouped_parity(monkeypatch, mode, topk, dtype):
             assert balanced.last_debug_stats.num_global_active_spare_slots > 0
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_TE, reason="TEGroupedMLP runtime wgrad test requires Transformer Engine.")
+@pytest.mark.skipif(
+    not is_te_min_version("1.9.0.dev0"),
+    reason="TEGroupedMLP is only supported in TE 1.9.0.dev0 and later.",
+)
+def test_balanced_moe_layer_te_grouped_runtime_weights_use_autograd_wgrad(monkeypatch):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        balanced_module, balanced_cls = _require_balanced_moe_layer()
+        _patch_planner(monkeypatch, balanced_module, "forced_move")
+
+        dtype = torch.bfloat16
+        _set_random_seed(seed_=1234, data_parallel_random_init=False)
+        balanced_config = _make_config(dtype, 1, balanced=True, grouped=True)
+        balanced_config.gradient_accumulation_fusion = True
+        balanced = balanced_cls(balanced_config, _submodules(grouped=True), layer_number=1)
+        assert isinstance(balanced.experts, TEGroupedMLP)
+        assert balanced_config.gradient_accumulation_fusion
+        assert not balanced.experts.linear_fc1.fuse_wgrad_accumulation
+        assert not balanced.experts.linear_fc2.fuse_wgrad_accumulation
+
+        balanced.cuda().to(dtype=dtype)
+        hidden = torch.randn(6, 2, 16, device="cuda", dtype=dtype, requires_grad=True)
+        output_grad = torch.randn_like(hidden)
+        _run_layer(balanced, hidden, output_grad)
+
+        assert hidden.grad is not None
+        assert any(param.grad is not None for param in balanced.experts.parameters())
+        _assert_no_spare_parameters(balanced)
+    finally:
+        Utils.destroy_model_parallel()

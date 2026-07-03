@@ -105,6 +105,8 @@ class BalancedMoELayer(BaseMoELayer):
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        if hasattr(self.experts, "disable_runtime_weight_main_grad_accumulation"):
+            self.experts.disable_runtime_weight_main_grad_accumulation()
         self.experts.free_expert_parameters(self.local_spare_expert_indices)
 
         self.expert_weight_dispatcher = AllToAllExpertWeightDispatcher(
