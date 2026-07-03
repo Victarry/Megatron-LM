@@ -90,6 +90,28 @@ def _make_local_routing(ep_size: int, topk: int, dtype: torch.dtype, device: tor
     return routing, probs
 
 
+def _make_routing_from_counts(
+    counts: torch.Tensor, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ep_size, num_home_experts = counts.shape
+    tokens_per_rank = int(counts.sum(dim=1).max().item())
+    routing = torch.zeros(
+        ep_size, tokens_per_rank, num_home_experts, dtype=torch.bool, device=device
+    )
+    probs = torch.zeros(ep_size, tokens_per_rank, num_home_experts, dtype=dtype, device=device)
+
+    for ep_rank in range(ep_size):
+        offset = 0
+        for expert_idx, count in enumerate(counts[ep_rank].tolist()):
+            end = offset + int(count)
+            if end > offset:
+                routing[ep_rank, offset:end, expert_idx] = True
+                probs[ep_rank, offset:end, expert_idx] = 1.0
+            offset = end
+
+    return routing, probs
+
+
 def _assert_equivalent_plan(
     original_map,
     original_probs,
@@ -103,6 +125,7 @@ def _assert_equivalent_plan(
     )
     assert torch.equal(restored_map, original_map)
     torch.testing.assert_close(restored_probs, original_probs, rtol=0, atol=0)
+    assert expert_offloading_map.sum(dim=0).max().item() <= 1
     assert torch.equal(rerouting_map.sum(dim=1), original_map.sum(dim=1))
     torch.testing.assert_close(rerouted_probs.sum(dim=1), original_probs.sum(dim=1), rtol=0, atol=0)
 
@@ -153,6 +176,35 @@ def test_offloading_planner_equivalence(topk, assignment_algorithm, spare_per_ep
     effective_per_rank = routing.shape[-1] // ep_size + spare_per_ep
     after_rank_load = effective.sum(dim=0).reshape(ep_size, effective_per_rank).sum(dim=1)
     assert after_rank_load.max() <= before_rank_load.max()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="offloading planner uses CUDA kernels")
+def test_approx_bin_packing_keeps_one_home_per_spare_slot():
+    planner = _require_offloading_planner()
+    device = torch.device("cuda")
+    ep_size = 8
+    num_home_experts = 32
+    counts = torch.zeros(ep_size, num_home_experts, dtype=torch.int32, device=device)
+    counts[0, 0:4] = torch.tensor([80, 90, 110, 120], dtype=torch.int32, device=device)
+    counts[0, 8:32] = 50
+    routing, probs = _make_routing_from_counts(counts, torch.float32, device)
+
+    rerouting_map, rerouted_probs, expert_offloading_map = planner.gen_offloading_plan(
+        routing[0],
+        probs[0],
+        counts,
+        ep_rank=0,
+        num_ep_ranks=ep_size,
+        num_spare_experts_per_ep_rank=1,
+        assignment_algorithm="approx_bin_packing",
+    )
+
+    _assert_equivalent_plan(
+        routing[0], probs[0], rerouting_map, rerouted_probs, expert_offloading_map, ep_size
+    )
+    assert expert_offloading_map.any(dim=0).sum().item() == 1
+    assert expert_offloading_map[:, 1].sum().item() == 1
+    assert expert_offloading_map[3, 1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="offloading planner uses CUDA kernels")

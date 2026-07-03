@@ -251,6 +251,11 @@ class BalancedMoELayer(BaseMoELayer):
             raise ValueError("BalancedMoELayer expects rerouting_map to be bool.")
         if expert_offloading_map.dtype != torch.bool:
             raise ValueError("BalancedMoELayer expects expert_offloading_map to be bool.")
+        if expert_offloading_map.sum(dim=0).max().item() > 1:
+            raise ValueError(
+                "BalancedMoELayer expected each spare expert slot to map to at most one "
+                "home expert."
+            )
         if not torch.equal(rerouting_map.sum(dim=1), routing_map.sum(dim=1)):
             raise ValueError("BalancedMoELayer planner changed per-token assignment counts.")
         torch.testing.assert_close(

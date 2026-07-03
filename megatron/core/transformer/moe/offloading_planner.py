@@ -187,6 +187,27 @@ def reclaim_spare_experts(
     )
 
 
+def _select_unique_home_per_spare(
+    count_tokens_from_home_expert_to_spare_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Keep the largest home-expert assignment for each runtime spare slot."""
+
+    selected_counts, selected_home_indices = count_tokens_from_home_expert_to_spare_expert.max(
+        dim=0
+    )
+    selected_spare_indices = torch.arange(
+        count_tokens_from_home_expert_to_spare_expert.shape[1],
+        device=count_tokens_from_home_expert_to_spare_expert.device,
+    )
+    active_spares = selected_counts > 0
+
+    unique_assignment = torch.zeros_like(count_tokens_from_home_expert_to_spare_expert)
+    unique_assignment[
+        selected_home_indices[active_spares], selected_spare_indices[active_spares]
+    ] = selected_counts[active_spares]
+    return unique_assignment
+
+
 def gen_intermediate(
     count_tokens_per_expert_from_ep_rank: torch.Tensor,
     ep_rank: Union[torch.Tensor, int],
@@ -526,6 +547,9 @@ def gen_offloading_plan_eager(
             f"{assignment_algorithm}. Expected 'one_shot_greedy' or 'approx_bin_packing'."
         )
 
+    count_tokens_from_home_expert_to_spare_expert = _select_unique_home_per_spare(
+        count_tokens_from_home_expert_to_spare_expert
+    )
     map_home_expert_to_spare = count_tokens_from_home_expert_to_spare_expert > 0
     first_pass, count_tokens_after_first_offload, capacity_spare_remaining = (
         breadth_first_allocation(
