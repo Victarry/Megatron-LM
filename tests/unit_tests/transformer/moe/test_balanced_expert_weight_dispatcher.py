@@ -13,6 +13,11 @@ from tests.unit_tests.test_utilities import Utils
 
 _BENCHMARK_WARMUP_ITERS = 5
 _BENCHMARK_ITERS = 20
+_BENCHMARK_WEIGHT_CASES = [
+    ("small_regression", torch.Size([256, 512])),
+    ("representative_fc1_proxy", torch.Size([4096, 2048])),
+    ("representative_fc2_proxy", torch.Size([2048, 4096])),
+]
 
 
 def _require_distributed_cuda(world_size=4):
@@ -38,14 +43,38 @@ def _cuda_event_latency_ms(fn, *, warmup_iters=_BENCHMARK_WARMUP_ITERS, iters=_B
     return start.elapsed_time(end) / iters, result
 
 
-def _distributed_latency_stats_ms(local_latency_ms, device):
-    local = torch.tensor(local_latency_ms, dtype=torch.float64, device=device)
-    max_latency = local.clone()
-    sum_latency = local.clone()
-    torch.distributed.all_reduce(max_latency, op=torch.distributed.ReduceOp.MAX)
-    torch.distributed.all_reduce(sum_latency, op=torch.distributed.ReduceOp.SUM)
-    mean_latency = sum_latency / torch.distributed.get_world_size()
-    return max_latency.item(), mean_latency.item()
+def _cuda_event_latency_and_peak_delta_mb(
+    fn, device, *, warmup_iters=_BENCHMARK_WARMUP_ITERS, iters=_BENCHMARK_ITERS
+):
+    result = None
+    for _ in range(warmup_iters):
+        result = fn()
+    torch.cuda.synchronize()
+
+    baseline_allocated = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        result = fn()
+    end.record()
+    torch.cuda.synchronize()
+    peak_delta_mb = max(
+        torch.cuda.max_memory_allocated(device) - baseline_allocated,
+        0,
+    ) / (1024 * 1024)
+    return start.elapsed_time(end) / iters, peak_delta_mb, result
+
+
+def _distributed_float_stats(local_value, device):
+    local = torch.tensor(local_value, dtype=torch.float64, device=device)
+    max_value = local.clone()
+    sum_value = local.clone()
+    torch.distributed.all_reduce(max_value, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(sum_value, op=torch.distributed.ReduceOp.SUM)
+    mean_value = sum_value / torch.distributed.get_world_size()
+    return max_value.item(), mean_value.item()
 
 
 def _require_expert_dispatcher():
@@ -623,7 +652,8 @@ def test_symmetric_memory_expert_weight_dispatch_uses_get_not_a2a(monkeypatch):
 
 
 @pytest.mark.internal
-def test_expert_weight_dispatch_latency_benchmark():
+@pytest.mark.parametrize("case_name, weight_shape", _BENCHMARK_WEIGHT_CASES)
+def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
     _require_distributed_cuda()
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
     try:
@@ -639,7 +669,6 @@ def test_expert_weight_dispatch_latency_benchmark():
         global_rank = torch.distributed.get_rank()
         device = torch.device("cuda", torch.cuda.current_device())
         dtype = torch.bfloat16
-        weight_shape = torch.Size([256, 512])
         local_home_weights = [
             _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
             for local_idx in range(2)
@@ -659,17 +688,25 @@ def test_expert_weight_dispatch_latency_benchmark():
             with torch.no_grad():
                 return native_dispatcher.dispatch(native_metadata, *local_home_weights)
 
-        native_latency_ms, native_dispatched = _cuda_event_latency_ms(run_native_dispatch)
+        native_latency_ms, native_peak_delta_mb, native_dispatched = (
+            _cuda_event_latency_and_peak_delta_mb(run_native_dispatch, device)
+        )
         assert native_latency_ms > 0.0
         assert len(native_dispatched) == 2
-        native_max_ms, native_mean_ms = _distributed_latency_stats_ms(native_latency_ms, device)
+        native_max_ms, native_mean_ms = _distributed_float_stats(native_latency_ms, device)
+        native_max_peak_mb, native_mean_peak_mb = _distributed_float_stats(
+            native_peak_delta_mb, device
+        )
 
         if global_rank == 0:
             print(
                 "BENCHMARK balanced_moe_expert_weight_dispatch "
-                f"backend=native_all_to_all dtype={dtype} weight_shape={tuple(weight_shape)} "
+                f"case={case_name} backend=native_all_to_all "
+                f"dtype={dtype} weight_shape={tuple(weight_shape)} "
                 f"warmup_iters={_BENCHMARK_WARMUP_ITERS} iters={_BENCHMARK_ITERS} "
-                f"mean_rank_ms={native_mean_ms:.4f} max_rank_ms={native_max_ms:.4f}",
+                f"mean_rank_ms={native_mean_ms:.4f} max_rank_ms={native_max_ms:.4f} "
+                f"mean_peak_delta_mb={native_mean_peak_mb:.2f} "
+                f"max_peak_delta_mb={native_max_peak_mb:.2f}",
                 flush=True,
             )
 
@@ -694,21 +731,29 @@ def test_expert_weight_dispatch_latency_benchmark():
                 with torch.no_grad():
                     return symm_dispatcher.dispatch(symm_metadata, *local_home_weights)
 
-            symm_latency_ms, symm_dispatched = _cuda_event_latency_ms(run_symm_dispatch)
+            symm_latency_ms, symm_peak_delta_mb, symm_dispatched = (
+                _cuda_event_latency_and_peak_delta_mb(run_symm_dispatch, device)
+            )
             assert symm_latency_ms > 0.0
             get_calls = torch.tensor(
                 symm_dispatcher._debug_low_level_get_calls, dtype=torch.int64, device=device
             )
             torch.distributed.all_reduce(get_calls, op=torch.distributed.ReduceOp.SUM)
             assert get_calls.item() > 0
-            symm_max_ms, symm_mean_ms = _distributed_latency_stats_ms(symm_latency_ms, device)
+            symm_max_ms, symm_mean_ms = _distributed_float_stats(symm_latency_ms, device)
+            symm_max_peak_mb, symm_mean_peak_mb = _distributed_float_stats(
+                symm_peak_delta_mb, device
+            )
 
             if global_rank == 0:
                 print(
                     "BENCHMARK balanced_moe_expert_weight_dispatch "
-                    f"backend=symmetric_memory dtype={dtype} weight_shape={tuple(weight_shape)} "
+                    f"case={case_name} backend=symmetric_memory "
+                    f"dtype={dtype} weight_shape={tuple(weight_shape)} "
                     f"warmup_iters={_BENCHMARK_WARMUP_ITERS} iters={_BENCHMARK_ITERS} "
-                    f"mean_rank_ms={symm_mean_ms:.4f} max_rank_ms={symm_max_ms:.4f}",
+                    f"mean_rank_ms={symm_mean_ms:.4f} max_rank_ms={symm_max_ms:.4f} "
+                    f"mean_peak_delta_mb={symm_mean_peak_mb:.2f} "
+                    f"max_peak_delta_mb={symm_max_peak_mb:.2f}",
                     flush=True,
                 )
 
@@ -717,7 +762,7 @@ def test_expert_weight_dispatch_latency_benchmark():
         elif global_rank == 0:
             print(
                 "BENCHMARK balanced_moe_expert_weight_dispatch "
-                f"backend=symmetric_memory skipped reason={symm_error!r}",
+                f"case={case_name} backend=symmetric_memory skipped reason={symm_error!r}",
                 flush=True,
             )
     finally:
