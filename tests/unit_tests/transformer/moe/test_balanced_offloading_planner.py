@@ -1,9 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import importlib
+import os
 
 import pytest
 import torch
+
+_BENCHMARK_WARMUP_ITERS = 5
+_BENCHMARK_ITERS = 20
 
 
 def _require_offloading_planner():
@@ -14,6 +18,28 @@ def _require_offloading_planner():
             "megatron.core.transformer.moe.offloading_planner is required for "
             "BalancedMoELayer planner parity tests."
         )
+
+
+def _cuda_event_latency_ms(fn, *, warmup_iters=_BENCHMARK_WARMUP_ITERS, iters=_BENCHMARK_ITERS):
+    result = None
+    for _ in range(warmup_iters):
+        result = fn()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        result = fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters, result
+
+
+def _current_cuda_device():
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank % torch.cuda.device_count())
+    return torch.device("cuda", torch.cuda.current_device())
 
 
 def _effective_column_for_home(home_idx, ep_size, home_per_rank, spare_per_rank):
@@ -247,3 +273,46 @@ def test_approx_bin_packing_rejects_multiple_spares_per_ep():
             num_spare_experts_per_ep_rank=2,
             assignment_algorithm="approx_bin_packing",
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="offloading planner uses CUDA kernels")
+def test_offloading_planner_kernel_latency_benchmark():
+    if os.getenv("MEGATRON_BALANCED_MOE_PLANNER_EAGER") == "1":
+        pytest.skip("Planner latency benchmark targets the production compiled path.")
+
+    planner = _require_offloading_planner()
+    device = _current_cuda_device()
+    ep_size = 8
+    num_home_experts = 32
+    counts = torch.full((ep_size, num_home_experts), 8, dtype=torch.int32, device=device)
+    counts[0, 0:4] = torch.tensor([512, 480, 448, 416], dtype=torch.int32, device=device)
+    counts[0, 4:] = 16
+    routing, probs = _make_routing_from_counts(counts, torch.float32, device)
+
+    def run_planner():
+        return planner.gen_offloading_plan(
+            routing[0],
+            probs[0],
+            counts,
+            ep_rank=0,
+            num_ep_ranks=ep_size,
+            num_spare_experts_per_ep_rank=1,
+            assignment_algorithm="approx_bin_packing",
+        )
+
+    latency_ms, (rerouting_map, rerouted_probs, expert_offloading_map) = _cuda_event_latency_ms(
+        run_planner
+    )
+    assert latency_ms > 0.0
+    assert torch.isfinite(torch.tensor(latency_ms, device=device))
+    _assert_equivalent_plan(
+        routing[0], probs[0], rerouting_map, rerouted_probs, expert_offloading_map, ep_size
+    )
+    print(
+        "BENCHMARK balanced_moe_planner_kernel "
+        f"algorithm=approx_bin_packing ep_size={ep_size} "
+        f"num_home_experts={num_home_experts} local_tokens={routing.shape[1]} "
+        f"warmup_iters={_BENCHMARK_WARMUP_ITERS} iters={_BENCHMARK_ITERS} "
+        f"mean_ms={latency_ms:.4f}",
+        flush=True,
+    )

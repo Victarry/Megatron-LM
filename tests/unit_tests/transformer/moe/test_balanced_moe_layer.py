@@ -41,6 +41,19 @@ def _require_balanced_moe_layer():
         pytest.fail("BalancedMoELayer class is required in balanced_moe_layer.py.")
 
 
+def _require_symmetric_memory_backend():
+    dispatcher_module = importlib.import_module(
+        "megatron.core.transformer.moe.expert_weight_dispatcher"
+    )
+    dispatcher_cls = getattr(dispatcher_module, "SymmetricMemoryExpertWeightDispatcher", None)
+    if dispatcher_cls is None:
+        pytest.fail("SymmetricMemoryExpertWeightDispatcher is required.")
+    availability_error = dispatcher_cls.availability_error()
+    if availability_error is not None:
+        pytest.skip(f"Symmetric Memory expert dispatch is unavailable: {availability_error}")
+    return dispatcher_cls
+
+
 def _make_config(
     dtype,
     topk,
@@ -49,6 +62,8 @@ def _make_config(
     random_offloading=False,
     grouped=False,
     shared_expert=False,
+    recompute_expert_dispatch=False,
+    expert_weight_backend="all_to_all",
 ):
     config = TransformerConfig(
         num_layers=1,
@@ -80,6 +95,8 @@ def _make_config(
         config.moe_balance_threshold_multiplier = 0.0
         config.moe_balance_debug_dump_path = None
         config.moe_balance_enable_debug_stats = True
+        config.moe_balance_recompute_expert_dispatch = recompute_expert_dispatch
+        config.moe_balance_expert_weight_dispatch_backend = expert_weight_backend
     return config
 
 
@@ -103,6 +120,7 @@ def _balanced_config_kwargs(**overrides):
         "moe_use_balanced_layer": True,
         "moe_num_spare_experts": 4,
         "moe_balance_assignment_algorithm": "approx_bin_packing",
+        "moe_balance_expert_weight_dispatch_backend": "all_to_all",
     }
     kwargs.update(overrides)
     return kwargs
@@ -327,11 +345,77 @@ def test_balanced_moe_layer_parity(monkeypatch, mode, topk, dtype):
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("expert_weight_backend", ["all_to_all", "symmetric_memory"])
+def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weight_backend):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        balanced_module, balanced_cls = _require_balanced_moe_layer()
+        _patch_planner(monkeypatch, balanced_module, "forced_move")
+
+        dispatcher_module = importlib.import_module(
+            "megatron.core.transformer.moe.expert_weight_dispatcher"
+        )
+        if expert_weight_backend == "symmetric_memory":
+            dispatcher_cls = _require_symmetric_memory_backend()
+        else:
+            dispatcher_cls = dispatcher_module.AllToAllExpertWeightDispatcher
+        original_dispatch = dispatcher_cls.dispatch
+        dispatch_calls = {"no_grad": 0, "grad": 0}
+
+        def counted_dispatch(self, metadata, *expert_weights):
+            if torch.is_grad_enabled():
+                dispatch_calls["grad"] += 1
+            else:
+                dispatch_calls["no_grad"] += 1
+            return original_dispatch(self, metadata, *expert_weights)
+
+        monkeypatch.setattr(dispatcher_cls, "dispatch", counted_dispatch)
+
+        dtype = torch.float32
+        _set_random_seed(seed_=1234, data_parallel_random_init=False)
+        baseline = MoELayer(_make_config(dtype, 1, balanced=False), _submodules(), layer_number=1)
+        balanced_config = _make_config(
+            dtype,
+            1,
+            balanced=True,
+            recompute_expert_dispatch=True,
+            expert_weight_backend=expert_weight_backend,
+        )
+        balanced = balanced_cls(balanced_config, _submodules(), layer_number=1)
+        assert isinstance(balanced.expert_weight_dispatcher, dispatcher_cls)
+        baseline.cuda()
+        balanced.cuda()
+        _copy_home_state(baseline, balanced)
+
+        hidden = torch.randn(6, 2, 16, device="cuda", dtype=dtype, requires_grad=True)
+        balanced_hidden = hidden.detach().clone().requires_grad_(True)
+        output_grad = torch.randn_like(hidden)
+
+        baseline_output = _run_layer(baseline, hidden, output_grad)
+        balanced_output = _run_layer(balanced, balanced_hidden, output_grad)
+
+        torch.testing.assert_close(balanced_output, baseline_output, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=1e-5, atol=1e-6)
+        _assert_router_grads_close(baseline, balanced, dtype)
+        _assert_home_expert_grads_close(baseline, balanced, dtype)
+        _assert_no_spare_parameters(balanced)
+        assert dispatch_calls["no_grad"] == 2
+        assert dispatch_calls["grad"] == 2
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
 @pytest.mark.parametrize(
     "overrides,error_match",
     [
         ({"expert_model_parallel_size": 1}, "expert_model_parallel_size > 1"),
         ({"moe_num_spare_experts": None}, "positive moe_num_spare_experts"),
+        (
+            {"moe_balance_expert_weight_dispatch_backend": "invalid"},
+            "expert_weight_dispatch_backend",
+        ),
         ({"moe_num_spare_experts": 8}, "one spare per EP rank"),
         ({"moe_token_dispatcher_type": "allgather"}, "moe_token_dispatcher_type='alltoall'"),
         ({"cuda_graph_impl": "local"}, "CUDA Graph"),
@@ -354,6 +438,9 @@ def test_module_spec_selects_balanced_layer():
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
     try:
         _, balanced_cls = _require_balanced_moe_layer()
+        dispatcher_module = importlib.import_module(
+            "megatron.core.transformer.moe.expert_weight_dispatcher"
+        )
         builder = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
 
         regular_layer = builder(config=_make_config(torch.float32, 1, balanced=False))
@@ -364,6 +451,114 @@ def test_module_spec_selects_balanced_layer():
         assert isinstance(balanced_layer, balanced_cls)
         assert "Balanced" not in type(balanced_layer.router).__name__
         assert type(balanced_layer.token_dispatcher).__name__ == "MoEAlltoAllTokenDispatcher"
+        assert isinstance(
+            balanced_layer.expert_weight_dispatcher,
+            dispatcher_module.AllToAllExpertWeightDispatcher,
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_balanced_moe_layer_symmetric_memory_backend_selection():
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        _, balanced_cls = _require_balanced_moe_layer()
+        symm_dispatcher_cls = _require_symmetric_memory_backend()
+
+        balanced = balanced_cls(
+            _make_config(
+                torch.float32,
+                1,
+                balanced=True,
+                expert_weight_backend="symmetric_memory",
+            ),
+            _submodules(),
+            layer_number=1,
+        )
+
+        assert isinstance(balanced.expert_weight_dispatcher, symm_dispatcher_cls)
+        assert type(balanced.token_dispatcher).__name__ == "MoEAlltoAllTokenDispatcher"
+        assert "symmetric" not in " ".join(balanced.state_dict().keys()).lower()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_balanced_moe_layer_symmetric_memory_backend_fails_fast_when_unavailable(monkeypatch):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        _, balanced_cls = _require_balanced_moe_layer()
+        dispatcher_module = importlib.import_module(
+            "megatron.core.transformer.moe.expert_weight_dispatcher"
+        )
+        monkeypatch.setattr(
+            dispatcher_module.SymmetricMemoryExpertWeightDispatcher,
+            "availability_error",
+            staticmethod(lambda: "simulated missing symmetric memory support"),
+        )
+
+        with pytest.raises(RuntimeError, match="symmetric_memory expert-weight dispatch"):
+            balanced_cls(
+                _make_config(
+                    torch.float32,
+                    1,
+                    balanced=True,
+                    expert_weight_backend="symmetric_memory",
+                ),
+                _submodules(),
+                layer_number=1,
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("mode", ["forced_move", "planner"])
+def test_balanced_moe_layer_symmetric_memory_backend_parity(monkeypatch, mode):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        balanced_module, balanced_cls = _require_balanced_moe_layer()
+        symm_dispatcher_cls = _require_symmetric_memory_backend()
+        if mode != "planner":
+            _patch_planner(monkeypatch, balanced_module, mode)
+
+        dtype = torch.float32
+        _set_random_seed(seed_=1234, data_parallel_random_init=False)
+        baseline = MoELayer(_make_config(dtype, 1, balanced=False), _submodules(), layer_number=1)
+        balanced = balanced_cls(
+            _make_config(
+                dtype,
+                1,
+                balanced=True,
+                expert_weight_backend="symmetric_memory",
+            ),
+            _submodules(),
+            layer_number=1,
+        )
+        assert isinstance(balanced.expert_weight_dispatcher, symm_dispatcher_cls)
+
+        baseline.cuda()
+        balanced.cuda()
+        _copy_home_state(baseline, balanced)
+
+        hidden = torch.randn(6, 2, 16, device="cuda", dtype=dtype, requires_grad=True)
+        balanced_hidden = hidden.detach().clone().requires_grad_(True)
+        output_grad = torch.randn_like(hidden)
+
+        baseline_output = _run_layer(baseline, hidden, output_grad)
+        balanced_output = _run_layer(balanced, balanced_hidden, output_grad)
+
+        torch.testing.assert_close(balanced_output, baseline_output, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=1e-5, atol=1e-6)
+        _assert_router_grads_close(baseline, balanced, dtype)
+        _assert_home_expert_grads_close(baseline, balanced, dtype)
+        _assert_no_spare_parameters(balanced)
+        assert balanced.last_debug_stats is not None
+        assert balanced.last_debug_stats.num_global_active_spare_slots > 0
     finally:
         Utils.destroy_model_parallel()
 

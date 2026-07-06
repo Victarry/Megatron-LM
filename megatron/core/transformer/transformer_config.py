@@ -895,6 +895,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_balance_enable_debug_stats: bool = False
     """Populate BalancedMoELayer scalar debug stats after each forward."""
 
+    moe_balance_recompute_expert_dispatch: bool = False
+    """Recompute BalancedMoELayer dispatched spare expert weights during backward."""
+
+    moe_balance_expert_weight_dispatch_backend: Literal["all_to_all", "symmetric_memory"] = (
+        "all_to_all"
+    )
+    """Expert-weight dispatch backend for BalancedMoELayer runtime spare weights."""
+
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
 
@@ -1884,6 +1892,15 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
 
         if self.moe_use_balanced_layer:
+            if self.moe_balance_expert_weight_dispatch_backend not in (
+                "all_to_all",
+                "symmetric_memory",
+            ):
+                raise ValueError(
+                    "BalancedMoELayer requires "
+                    "moe_balance_expert_weight_dispatch_backend to be one of "
+                    "'all_to_all' or 'symmetric_memory'."
+                )
             if self.num_moe_experts is None:
                 raise ValueError("BalancedMoELayer requires num_moe_experts.")
             if self.moe_ffn_hidden_size is None:

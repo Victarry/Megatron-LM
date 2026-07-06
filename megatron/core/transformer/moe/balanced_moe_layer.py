@@ -8,13 +8,17 @@ import inspect
 from collections import OrderedDict
 from copy import copy
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional
 
 import torch
 
-from megatron.core import utils
+from megatron.core import tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.moe.expert_weight_dispatcher import AllToAllExpertWeightDispatcher
+from megatron.core.transformer.moe.expert_weight_dispatcher import (
+    AllToAllExpertWeightDispatcher,
+    SymmetricMemoryExpertWeightDispatcher,
+)
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.offloading_planner import (
@@ -109,12 +113,7 @@ class BalancedMoELayer(BaseMoELayer):
             self.experts.disable_runtime_weight_main_grad_accumulation()
         self.experts.free_expert_parameters(self.local_spare_expert_indices)
 
-        self.expert_weight_dispatcher = AllToAllExpertWeightDispatcher(
-            config=self.config,
-            ep_group=self.ep_group,
-            num_home_experts=self.num_home_experts,
-            num_spare_experts=self.num_spare_experts,
-        )
+        self.expert_weight_dispatcher = self._make_expert_weight_dispatcher()
 
         if self.use_shared_expert:
             assert (
@@ -138,10 +137,43 @@ class BalancedMoELayer(BaseMoELayer):
         except (TypeError, ValueError):
             return True
 
+    def _make_expert_weight_dispatcher(self):
+        backend = getattr(
+            self.config, "moe_balance_expert_weight_dispatch_backend", "all_to_all"
+        )
+        dispatcher_kwargs = {
+            "config": self.config,
+            "ep_group": self.ep_group,
+            "num_home_experts": self.num_home_experts,
+            "num_spare_experts": self.num_spare_experts,
+        }
+        if backend == "all_to_all":
+            return AllToAllExpertWeightDispatcher(**dispatcher_kwargs)
+        if backend == "symmetric_memory":
+            availability_error = SymmetricMemoryExpertWeightDispatcher.availability_error()
+            if availability_error is not None:
+                raise RuntimeError(
+                    "BalancedMoELayer symmetric_memory expert-weight dispatch is unavailable: "
+                    f"{availability_error}"
+                )
+            return SymmetricMemoryExpertWeightDispatcher(**dispatcher_kwargs)
+        raise ValueError(
+            "BalancedMoELayer requires moe_balance_expert_weight_dispatch_backend to be "
+            "'all_to_all' or 'symmetric_memory'."
+        )
+
     @staticmethod
     def _validate_config(config: TransformerConfig) -> None:
         if not getattr(config, "moe_use_balanced_layer", False):
             return
+        if getattr(config, "moe_balance_expert_weight_dispatch_backend", "all_to_all") not in (
+            "all_to_all",
+            "symmetric_memory",
+        ):
+            raise ValueError(
+                "BalancedMoELayer requires moe_balance_expert_weight_dispatch_backend "
+                "to be 'all_to_all' or 'symmetric_memory'."
+            )
         if config.num_moe_experts is None:
             raise ValueError("BalancedMoELayer requires num_moe_experts.")
         if config.moe_ffn_hidden_size is None:
@@ -264,14 +296,34 @@ class BalancedMoELayer(BaseMoELayer):
             rerouted_probs.sum(dim=1), probs.sum(dim=1), rtol=0, atol=1e-6
         )
 
-    def _install_spare_expert_weights(self, expert_offloading_map: torch.Tensor) -> None:
+    def _install_spare_expert_weights(
+        self, expert_offloading_map: torch.Tensor
+    ) -> list[tensor_parallel.CheckpointWithoutOutput]:
         metadata = self.expert_weight_dispatcher.preprocess(expert_offloading_map)
+        checkpoints: list[tensor_parallel.CheckpointWithoutOutput] = []
+        recompute_dispatch = getattr(self.config, "moe_balance_recompute_expert_dispatch", False)
         for module in ("fc1", "fc2"):
             home_weights = self.experts.get_expert_weights(
                 module, self.local_home_expert_indices
             )
-            spare_weights = self.expert_weight_dispatcher.dispatch(metadata, *home_weights)
+            if recompute_dispatch:
+                checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                spare_weights = list(
+                    checkpoint.checkpoint(
+                        partial(self._dispatch_spare_expert_weights_for_checkpoint, metadata),
+                        *home_weights,
+                    )
+                )
+                checkpoints.append(checkpoint)
+            else:
+                spare_weights = self.expert_weight_dispatcher.dispatch(metadata, *home_weights)
             self.experts.set_expert_weights(module, spare_weights, self.local_spare_expert_indices)
+        return checkpoints
+
+    def _dispatch_spare_expert_weights_for_checkpoint(
+        self, metadata, *home_weights: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return tuple(self.expert_weight_dispatcher.dispatch(metadata, *home_weights))
 
     def _effective_spare_columns(self) -> list[int]:
         columns = []
@@ -379,7 +431,7 @@ class BalancedMoELayer(BaseMoELayer):
         self._maybe_record_debug_stats(
             tokens_per_expert_from_ep_rank, rerouting_map, expert_offloading_map
         )
-        self._install_spare_expert_weights(expert_offloading_map)
+        expert_dispatch_checkpoints = self._install_spare_expert_weights(expert_offloading_map)
 
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, rerouting_map, rerouted_probs
@@ -397,6 +449,9 @@ class BalancedMoELayer(BaseMoELayer):
         output = self.token_dispatcher.combine_preprocess(expert_output)
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
+
+        for checkpoint in expert_dispatch_checkpoints:
+            checkpoint.discard_output_and_register_recompute(output)
 
         if shared_expert_output is not None:
             output = output + shared_expert_output
