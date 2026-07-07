@@ -10,12 +10,21 @@ parameters through the reverse communication pattern.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 
+from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    from deep_ep import HybridEPBuffer
+except ImportError:
+    HybridEPBuffer = None
+
+_HYBRIDEP_WEIGHT_TOKEN_ALIGNMENT = 64
 
 
 @dataclass
@@ -61,6 +70,8 @@ class _AllToAllExpertWeightDispatch(torch.autograd.Function):
         recv_local_spare_indices: list[int],
         *local_home_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
+        """Send active home expert weights to local spare expert slots."""
+
         if len(local_home_weights) != num_local_home_experts:
             raise ValueError(
                 f"Expected {num_local_home_experts} local home weights, "
@@ -130,6 +141,8 @@ class _AllToAllExpertWeightDispatch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs: Optional[torch.Tensor]):
+        """Fold spare expert gradients back to their owning home experts."""
+
         grad_send_tensors: list[torch.Tensor] = []
         for local_spare_idx in ctx.recv_local_spare_indices:
             grad_output = grad_outputs[local_spare_idx]
@@ -311,8 +324,7 @@ def _get_symmetric_memory_module():
     missing = [name for name in ("empty", "rendezvous") if not hasattr(symm_mem, name)]
     if missing:
         raise RuntimeError(
-            "torch.distributed._symmetric_memory is missing required API(s): "
-            + ", ".join(missing)
+            "torch.distributed._symmetric_memory is missing required API(s): " + ", ".join(missing)
         )
     return symm_mem
 
@@ -343,6 +355,8 @@ class _SymmetricMemoryExpertWeightDispatch(torch.autograd.Function):
         metadata: ExpertWeightDispatchMetadata,
         *local_home_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
+        """Read remote home expert weights through symmetric-memory handles."""
+
         dispatcher._validate_weights(local_home_weights)
         reference_weight = local_home_weights[0]
         weight_numel = reference_weight.numel()
@@ -395,6 +409,8 @@ class _SymmetricMemoryExpertWeightDispatch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs: Optional[torch.Tensor]):
+        """Read remote spare gradients and accumulate local home gradients."""
+
         dispatcher: SymmetricMemoryExpertWeightDispatcher = ctx.dispatcher
         metadata: ExpertWeightDispatchMetadata = ctx.dispatch_metadata
         workspace: _SymmetricExpertWeightDispatchWorkspace = ctx.workspace
@@ -473,6 +489,8 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
 
     @staticmethod
     def availability_error() -> Optional[str]:
+        """Return why SymmMem dispatch is unavailable, or None when usable."""
+
         try:
             _get_symmetric_memory_module()
         except RuntimeError as exc:
@@ -509,11 +527,7 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
     def _get_workspace(
         self, reference_weight: torch.Tensor
     ) -> _SymmetricExpertWeightDispatchWorkspace:
-        key = (
-            tuple(reference_weight.shape),
-            reference_weight.dtype,
-            str(reference_weight.device),
-        )
+        key = (tuple(reference_weight.shape), reference_weight.dtype, str(reference_weight.device))
         workspace = self._workspaces.get(key)
         if workspace is not None:
             return workspace
@@ -522,14 +536,10 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
         device = reference_weight.device
         dtype = reference_weight.dtype
         home_weight_buffer = self._symm_mem.empty(
-            self.num_local_home_experts * weight_numel,
-            dtype=dtype,
-            device=device,
+            self.num_local_home_experts * weight_numel, dtype=dtype, device=device
         )
         spare_grad_buffer = self._symm_mem.empty(
-            self.num_local_spare_experts * weight_numel,
-            dtype=dtype,
-            device=device,
+            self.num_local_spare_experts * weight_numel, dtype=dtype, device=device
         )
         workspace = _SymmetricExpertWeightDispatchWorkspace(
             home_weight_buffer=home_weight_buffer,
@@ -545,12 +555,7 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
         return workspace
 
     def _copy_from_symmetric_peer(
-        self,
-        dst_flat: torch.Tensor,
-        handle,
-        *,
-        peer: int,
-        offset: int,
+        self, dst_flat: torch.Tensor, handle, *, peer: int, offset: int
     ) -> None:
         self._debug_low_level_get_calls += 1
         if hasattr(self._symm_mem, "get"):
@@ -562,9 +567,7 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
                 "Symmetric Memory handle does not expose get_buffer, and "
                 "torch.distributed._symmetric_memory.get is unavailable."
             )
-        peer_buffer = handle.get_buffer(
-            peer, (offset + dst_flat.numel(),), dtype=dst_flat.dtype
-        )
+        peer_buffer = handle.get_buffer(peer, (offset + dst_flat.numel(),), dtype=dst_flat.dtype)
         dst_flat.copy_(peer_buffer[offset : offset + dst_flat.numel()])
 
     def dispatch(
@@ -572,3 +575,429 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
     ) -> list[torch.Tensor]:
         outputs = _SymmetricMemoryExpertWeightDispatch.apply(self, metadata, *expert_weights)
         return list(outputs)
+
+
+class _HybridEPExpertWeightChunkDispatch(torch.autograd.Function):
+    """Autograd bridge for HybridEP weight-chunk dispatch.
+
+    The generic HybridEP token wrapper propagates routing probability gradients.
+    Expert weights do not have routing probabilities, so this bridge matches the
+    historical Echo expert-weight path and calls the HybridEP primitives with
+    ``probs=None`` in both forward and backward.
+    """
+
+    _buffer = None
+    _buffer_key = None
+
+    @staticmethod
+    def _get_buffer(
+        group: torch.distributed.ProcessGroup,
+        hidden_dim: int,
+        max_num_tokens: int,
+        num_local_experts: int,
+        num_sms_dispatch_api: Optional[int],
+        num_sms_combine_api: Optional[int],
+        num_blocks_permute: Optional[int],
+        num_blocks_unpermute: Optional[int],
+        num_sms_preprocessing_api: Optional[int],
+    ):
+        if HybridEPBuffer is None:
+            raise RuntimeError("HybridEP is not installed.")
+
+        key = (
+            group,
+            hidden_dim,
+            max_num_tokens,
+            num_local_experts,
+            num_sms_dispatch_api,
+            num_sms_combine_api,
+            num_blocks_permute,
+            num_blocks_unpermute,
+            num_sms_preprocessing_api,
+        )
+        if _HybridEPExpertWeightChunkDispatch._buffer is not None:
+            current_key = _HybridEPExpertWeightChunkDispatch._buffer_key
+            if (
+                current_key is not None
+                and current_key[0] is group
+                and current_key[1] == hidden_dim
+                and current_key[2] >= max_num_tokens
+                and current_key[3:] == key[3:]
+            ):
+                return _HybridEPExpertWeightChunkDispatch._buffer
+
+        kwargs = {}
+        if num_sms_dispatch_api is not None:
+            kwargs["num_sms_dispatch_api"] = num_sms_dispatch_api
+        if num_sms_combine_api is not None:
+            kwargs["num_sms_combine_api"] = num_sms_combine_api
+        if num_blocks_permute is not None:
+            kwargs["num_blocks_permute"] = num_blocks_permute
+        if num_blocks_unpermute is not None:
+            kwargs["num_blocks_unpermute"] = num_blocks_unpermute
+        if num_sms_preprocessing_api is not None:
+            kwargs["num_sms_preprocessing_api"] = num_sms_preprocessing_api
+
+        _HybridEPExpertWeightChunkDispatch._buffer = HybridEPBuffer(
+            group=group,
+            hidden_dim=hidden_dim,
+            max_num_of_tokens_per_rank=max_num_tokens,
+            num_local_experts=num_local_experts,
+            use_fp8=False,
+            **kwargs,
+        )
+        _HybridEPExpertWeightChunkDispatch._buffer_key = key
+        return _HybridEPExpertWeightChunkDispatch._buffer
+
+    @staticmethod
+    def forward(
+        ctx,
+        flat_chunks: torch.Tensor,
+        routing_map: torch.Tensor,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        num_permuted_tokens: int,
+        num_sms_dispatch_api: Optional[int],
+        num_sms_combine_api: Optional[int],
+        num_blocks_permute: Optional[int],
+        num_blocks_unpermute: Optional[int],
+        num_sms_preprocessing_api: Optional[int],
+    ) -> torch.Tensor:
+        """Dispatch flattened expert-weight chunks through HybridEP."""
+
+        buffer = _HybridEPExpertWeightChunkDispatch._get_buffer(
+            group,
+            flat_chunks.shape[1],
+            flat_chunks.shape[0],
+            num_local_experts,
+            num_sms_dispatch_api,
+            num_sms_combine_api,
+            num_blocks_permute,
+            num_blocks_unpermute,
+            num_sms_preprocessing_api,
+        )
+        dispatched_chunks, _, _, _, handle = buffer.dispatch_with_permute(
+            hidden=flat_chunks,
+            routing_map=routing_map,
+            probs=None,
+            scaling_factor=None,
+            num_of_experts_per_rank=num_local_experts,
+            pad_multiple=None,
+            num_permuted_tokens=num_permuted_tokens,
+            non_blocking=True,
+        )
+
+        ctx.handle = handle
+        return dispatched_chunks
+
+    @staticmethod
+    def backward(ctx, grad_dispatched_chunks: torch.Tensor):
+        """Combine HybridEP-dispatched chunk gradients back to input chunks."""
+
+        buffer = _HybridEPExpertWeightChunkDispatch._buffer
+        if buffer is None:
+            raise RuntimeError("HybridEP expert-weight dispatch buffer is not initialized.")
+
+        combined_chunks, _ = buffer.combine_with_unpermute(
+            hidden=grad_dispatched_chunks.contiguous(),
+            probs=None,
+            handle=ctx.handle,
+            pad_multiple=None,
+        )
+        return combined_chunks, None, None, None, None, None, None, None, None, None
+
+
+class HybridEPExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
+    """Experimental HybridEP expert-weight dispatcher.
+
+    This backend treats flattened expert-weight chunks as HybridEP token rows and
+    routes those rows to spare expert slots. HybridEP's autograd combine path
+    folds spare gradients back to the home weight chunks.
+    """
+
+    @staticmethod
+    def availability_error() -> Optional[str]:
+        """Return why HybridEP dispatch is unavailable, or None when usable."""
+
+        if not HAVE_HYBRIDEP or HybridEPBuffer is None:
+            return (
+                "HybridEP is not installed. Please install the DeepEP HybridEP package "
+                "or use moe_balance_expert_weight_dispatch_backend='all_to_all'."
+            )
+        return None
+
+    @staticmethod
+    def _weight_chunk_size(reference_weight: torch.Tensor) -> int:
+        return 8192
+
+    def _validate_weights(self, local_home_weights: tuple[torch.Tensor, ...]) -> None:
+        if len(local_home_weights) != self.num_local_home_experts:
+            raise ValueError(
+                f"Expected {self.num_local_home_experts} local home weights, "
+                f"got {len(local_home_weights)}."
+            )
+        if not local_home_weights:
+            raise ValueError("At least one local home weight is required.")
+
+        reference_weight = local_home_weights[0]
+        if reference_weight.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "HybridEP expert-weight dispatch supports only 16-bit floating "
+                f"weights (fp16/bf16); got {reference_weight.dtype}."
+            )
+        for weight in local_home_weights:
+            if weight.shape != reference_weight.shape:
+                raise ValueError(
+                    "All expert weights in one dispatch call must have the same shape; "
+                    f"got {tuple(weight.shape)} and {tuple(reference_weight.shape)}."
+                )
+            if weight.dtype != reference_weight.dtype:
+                raise ValueError(
+                    "All expert weights in one dispatch call must have the same dtype; "
+                    f"got {weight.dtype} and {reference_weight.dtype}."
+                )
+            if weight.device != reference_weight.device:
+                raise ValueError(
+                    "All expert weights in one dispatch call must be on the same device; "
+                    f"got {weight.device} and {reference_weight.device}."
+                )
+
+    def _chunk_local_home_weights(
+        self, local_home_weights: tuple[torch.Tensor, ...]
+    ) -> tuple[list[torch.Tensor], int, int, int]:
+        reference_weight = local_home_weights[0]
+        weight_numel = reference_weight.numel()
+        chunk_size = self._weight_chunk_size(reference_weight)
+        chunks_per_weight = math.ceil(weight_numel / chunk_size)
+        padded_numel = chunks_per_weight * chunk_size
+
+        chunked_weights = []
+        for weight in local_home_weights:
+            flat_weight = weight.reshape(-1)
+            if padded_numel != weight_numel:
+                flat_weight = torch.cat(
+                    [flat_weight, flat_weight.new_zeros(padded_numel - weight_numel)], dim=0
+                )
+            chunked_weights.append(flat_weight.view(chunks_per_weight, chunk_size))
+        return chunked_weights, chunks_per_weight, chunk_size, weight_numel
+
+    def _flatten_local_home_weights(
+        self, local_home_weights: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, int, int]:
+        chunked_weights, chunks_per_weight, chunk_size, weight_numel = (
+            self._chunk_local_home_weights(local_home_weights)
+        )
+        if not chunked_weights:
+            reference_weight = local_home_weights[0]
+            return reference_weight.new_empty((0, chunk_size)), chunks_per_weight, weight_numel
+        return torch.cat(chunked_weights, dim=0).contiguous(), chunks_per_weight, weight_numel
+
+    def _make_local_spare_sources(
+        self, metadata: ExpertWeightDispatchMetadata
+    ) -> list[Optional[tuple[int, int]]]:
+        local_spare_home_indices = metadata.local_spare_home_indices.cpu().tolist()
+        sources: list[Optional[tuple[int, int]]] = [None] * self.num_local_spare_experts
+        for local_spare_idx, home_idx in enumerate(local_spare_home_indices):
+            if home_idx < 0:
+                continue
+            sources[local_spare_idx] = (
+                home_idx // self.num_local_home_experts,
+                home_idx % self.num_local_home_experts,
+            )
+        return sources
+
+    def _make_remote_spare_aliases(
+        self, local_spare_sources: list[Optional[tuple[int, int]]]
+    ) -> list[Optional[int]]:
+        aliases: list[Optional[int]] = [None] * self.num_local_spare_experts
+        for local_spare_idx, source in enumerate(local_spare_sources):
+            if source is None:
+                continue
+            source_rank, local_home_idx = source
+            if source_rank == self.ep_rank:
+                continue
+            aliases[local_spare_idx] = min(
+                idx
+                for idx, candidate_source in enumerate(local_spare_sources)
+                if candidate_source == (source_rank, local_home_idx)
+            )
+        return aliases
+
+    def _flatten_coalesced_route_chunks(
+        self, metadata: ExpertWeightDispatchMetadata, local_home_weights: tuple[torch.Tensor, ...]
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, int, int, list[Optional[tuple[int, int]]], list[Optional[int]]
+    ]:
+        reference_weight = local_home_weights[0]
+        chunked_weights, chunks_per_weight, chunk_size, weight_numel = (
+            self._chunk_local_home_weights(local_home_weights)
+        )
+        local_home_routes = metadata.local_to_global_routing_map.reshape(
+            self.num_local_home_experts, self.ep_size, self.num_local_spare_experts
+        )
+
+        pair_chunks: list[torch.Tensor] = []
+        pair_routes: list[torch.Tensor] = []
+        for local_home_idx in range(self.num_local_home_experts):
+            for dest_rank in range(self.ep_size):
+                if dest_rank == self.ep_rank:
+                    continue
+                local_spare_indices = torch.where(local_home_routes[local_home_idx, dest_rank])[0]
+                if local_spare_indices.numel() == 0:
+                    continue
+                representative_local_spare_idx = int(local_spare_indices.min().item())
+                representative_global_spare_idx = (
+                    dest_rank * self.num_local_spare_experts + representative_local_spare_idx
+                )
+                route = torch.zeros(
+                    (chunks_per_weight, self.num_spare_experts),
+                    dtype=torch.bool,
+                    device=reference_weight.device,
+                )
+                route[:, representative_global_spare_idx] = True
+                pair_chunks.append(chunked_weights[local_home_idx])
+                pair_routes.append(route)
+
+        if pair_chunks:
+            flat_chunks = torch.cat(pair_chunks, dim=0).contiguous()
+            chunk_routing_map = torch.cat(pair_routes, dim=0).contiguous()
+        else:
+            flat_chunks = reference_weight.new_empty((0, chunk_size))
+            chunk_routing_map = torch.zeros(
+                (0, self.num_spare_experts), dtype=torch.bool, device=reference_weight.device
+            )
+        local_spare_sources = self._make_local_spare_sources(metadata)
+        return (
+            flat_chunks,
+            chunk_routing_map,
+            chunks_per_weight,
+            weight_numel,
+            local_spare_sources,
+            self._make_remote_spare_aliases(local_spare_sources),
+        )
+
+    def _pad_chunks_for_hybridep(
+        self, flat_chunks: torch.Tensor, chunk_routing_map: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        local_rows = torch.tensor(
+            [flat_chunks.shape[0]], dtype=torch.long, device=flat_chunks.device
+        )
+        max_rows = local_rows.clone()
+        torch.distributed.all_reduce(
+            max_rows, op=torch.distributed.ReduceOp.MAX, group=self.ep_group
+        )
+        padded_rows = int(max_rows.item())
+        if padded_rows == 0:
+            return flat_chunks, chunk_routing_map
+        padded_rows += -padded_rows % _HYBRIDEP_WEIGHT_TOKEN_ALIGNMENT
+        if padded_rows == flat_chunks.shape[0]:
+            return flat_chunks, chunk_routing_map
+
+        pad_rows = padded_rows - flat_chunks.shape[0]
+        if pad_rows < 0:
+            raise RuntimeError("HybridEP input padding computed a negative pad row count.")
+        flat_chunks = torch.cat(
+            [flat_chunks, flat_chunks.new_zeros((pad_rows, flat_chunks.shape[1]))], dim=0
+        )
+        chunk_routing_map = torch.cat(
+            [
+                chunk_routing_map,
+                chunk_routing_map.new_zeros((pad_rows, chunk_routing_map.shape[1])),
+            ],
+            dim=0,
+        )
+        return flat_chunks.contiguous(), chunk_routing_map.contiguous()
+
+    def dispatch(
+        self, metadata: ExpertWeightDispatchMetadata, *expert_weights: torch.Tensor
+    ) -> list[torch.Tensor]:
+        availability_error = self.availability_error()
+        if availability_error is not None:
+            raise RuntimeError(availability_error)
+        self._validate_weights(expert_weights)
+
+        reference_weight = expert_weights[0]
+        zero_home_dependency = reference_weight.new_zeros(())
+        for weight in expert_weights:
+            zero_home_dependency = zero_home_dependency + weight.sum() * 0.0
+        (
+            flat_chunks,
+            chunk_routing_map,
+            chunks_per_weight,
+            weight_numel,
+            local_spare_sources,
+            remote_spare_aliases,
+        ) = self._flatten_coalesced_route_chunks(metadata, expert_weights)
+        flat_chunks, chunk_routing_map = self._pad_chunks_for_hybridep(
+            flat_chunks, chunk_routing_map
+        )
+
+        num_local_output_chunks = self.num_local_spare_experts * chunks_per_weight
+        if flat_chunks.shape[0] == 0:
+            outputs: list[torch.Tensor] = []
+            for source in local_spare_sources:
+                if source is None:
+                    outputs.append(
+                        reference_weight.new_zeros(reference_weight.shape) + zero_home_dependency
+                    )
+                    continue
+                source_rank, local_home_idx = source
+                if source_rank != self.ep_rank:
+                    raise RuntimeError(
+                        "HybridEP expert-weight dispatch has remote receive aliases but no "
+                        "remote send rows in the EP group."
+                    )
+                outputs.append(expert_weights[local_home_idx] + zero_home_dependency)
+            return outputs
+
+        flat_chunks = flat_chunks + zero_home_dependency
+        dispatched_chunks = _HybridEPExpertWeightChunkDispatch.apply(
+            flat_chunks,
+            chunk_routing_map,
+            self.ep_group,
+            self.num_local_spare_experts,
+            num_local_output_chunks,
+            getattr(self.config, "moe_hybridep_num_sms", None),
+            getattr(self.config, "moe_hybridep_num_sms", None),
+            getattr(self.config, "moe_hybridep_num_blocks_permute", None),
+            getattr(self.config, "moe_hybridep_num_blocks_unpermute", None),
+            getattr(self.config, "moe_hybridep_num_sms_preprocessing", 108),
+        )
+
+        if dispatched_chunks.shape[0] != num_local_output_chunks:
+            raise RuntimeError(
+                "HybridEP expert-weight dispatch returned an unexpected number of chunks: "
+                f"expected {num_local_output_chunks}, got {dispatched_chunks.shape[0]}."
+            )
+        dispatched_slot_chunks = dispatched_chunks.chunk(self.num_local_spare_experts, dim=0)
+        zero_dispatch_dependency = dispatched_chunks.masked_fill(
+            torch.ones((), dtype=torch.bool, device=dispatched_chunks.device), 0.0
+        ).sum()
+        zero_dependency = zero_home_dependency + zero_dispatch_dependency
+        representative_outputs: dict[int, torch.Tensor] = {}
+        outputs: list[torch.Tensor] = []
+        for local_spare_idx, source in enumerate(local_spare_sources):
+            if source is None:
+                outputs.append(reference_weight.new_zeros(reference_weight.shape) + zero_dependency)
+                continue
+
+            source_rank, local_home_idx = source
+            if source_rank == self.ep_rank:
+                outputs.append(expert_weights[local_home_idx] + zero_dependency)
+                continue
+
+            representative_local_spare_idx = remote_spare_aliases[local_spare_idx]
+            if representative_local_spare_idx is None:
+                raise RuntimeError(
+                    "HybridEP expert-weight dispatch missing a representative slot for "
+                    f"remote local spare {local_spare_idx}."
+                )
+            if representative_local_spare_idx not in representative_outputs:
+                flat_weight = dispatched_slot_chunks[representative_local_spare_idx].reshape(-1)[
+                    :weight_numel
+                ]
+                representative_outputs[representative_local_spare_idx] = (
+                    flat_weight.view(reference_weight.shape) + zero_dependency
+                )
+            outputs.append(representative_outputs[representative_local_spare_idx])
+        return outputs

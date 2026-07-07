@@ -54,6 +54,19 @@ def _require_symmetric_memory_backend():
     return dispatcher_cls
 
 
+def _require_hybridep_backend():
+    dispatcher_module = importlib.import_module(
+        "megatron.core.transformer.moe.expert_weight_dispatcher"
+    )
+    dispatcher_cls = getattr(dispatcher_module, "HybridEPExpertWeightDispatcher", None)
+    if dispatcher_cls is None:
+        pytest.fail("HybridEPExpertWeightDispatcher is required.")
+    availability_error = dispatcher_cls.availability_error()
+    if availability_error is not None:
+        pytest.skip(f"HybridEP expert dispatch is unavailable: {availability_error}")
+    return dispatcher_cls
+
+
 def _make_config(
     dtype,
     topk,
@@ -183,7 +196,11 @@ def _extend_home_routing(routing_map, probs):
         effective_col = _effective_col_home(home_idx)
         extended_map[:, effective_col] = routing_map[:, home_idx]
         extended_probs[:, effective_col] = probs[:, home_idx]
-    return extended_map, extended_probs, torch.zeros(8, 4, dtype=torch.bool, device=routing_map.device)
+    return (
+        extended_map,
+        extended_probs,
+        torch.zeros(8, 4, dtype=torch.bool, device=routing_map.device),
+    )
 
 
 def _forced_move_plan(routing_map, probs):
@@ -231,7 +248,9 @@ def _run_layer(layer, hidden_states, output_grad, **forward_kwargs):
 
 
 def _assert_router_grads_close(baseline, balanced, dtype):
-    for baseline_param, balanced_param in zip(baseline.router.parameters(), balanced.router.parameters()):
+    for baseline_param, balanced_param in zip(
+        baseline.router.parameters(), balanced.router.parameters()
+    ):
         _assert_grad_close(balanced_param, baseline_param, dtype)
 
 
@@ -311,7 +330,9 @@ def test_balanced_moe_layer_parity(monkeypatch, mode, topk, dtype):
             _patch_planner(monkeypatch, balanced_module, mode)
 
         _set_random_seed(seed_=1234, data_parallel_random_init=False)
-        baseline = MoELayer(_make_config(dtype, topk, balanced=False), _submodules(), layer_number=1)
+        baseline = MoELayer(
+            _make_config(dtype, topk, balanced=False), _submodules(), layer_number=1
+        )
         balanced_config = _make_config(
             dtype, topk, balanced=True, random_offloading=(mode == "random")
         )
@@ -345,7 +366,7 @@ def test_balanced_moe_layer_parity(monkeypatch, mode, topk, dtype):
 
 
 @pytest.mark.internal
-@pytest.mark.parametrize("expert_weight_backend", ["all_to_all", "symmetric_memory"])
+@pytest.mark.parametrize("expert_weight_backend", ["all_to_all", "symmetric_memory", "hybridep"])
 def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weight_backend):
     _require_distributed_cuda()
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
@@ -358,6 +379,8 @@ def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weigh
         )
         if expert_weight_backend == "symmetric_memory":
             dispatcher_cls = _require_symmetric_memory_backend()
+        elif expert_weight_backend == "hybridep":
+            dispatcher_cls = _require_hybridep_backend()
         else:
             dispatcher_cls = dispatcher_module.AllToAllExpertWeightDispatcher
         original_dispatch = dispatcher_cls.dispatch
@@ -372,7 +395,7 @@ def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weigh
 
         monkeypatch.setattr(dispatcher_cls, "dispatch", counted_dispatch)
 
-        dtype = torch.float32
+        dtype = torch.bfloat16 if expert_weight_backend == "hybridep" else torch.float32
         _set_random_seed(seed_=1234, data_parallel_random_init=False)
         baseline = MoELayer(_make_config(dtype, 1, balanced=False), _submodules(), layer_number=1)
         balanced_config = _make_config(
@@ -395,8 +418,12 @@ def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weigh
         baseline_output = _run_layer(baseline, hidden, output_grad)
         balanced_output = _run_layer(balanced, balanced_hidden, output_grad)
 
-        torch.testing.assert_close(balanced_output, baseline_output, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=1e-5, atol=1e-6)
+        if dtype is torch.bfloat16:
+            torch.testing.assert_close(balanced_output, baseline_output, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=2e-2, atol=2e-2)
+        else:
+            torch.testing.assert_close(balanced_output, baseline_output, rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=1e-5, atol=1e-6)
         _assert_router_grads_close(baseline, balanced, dtype)
         _assert_home_expert_grads_close(baseline, balanced, dtype)
         _assert_no_spare_parameters(balanced)
@@ -468,12 +495,7 @@ def test_balanced_moe_layer_symmetric_memory_backend_selection():
         symm_dispatcher_cls = _require_symmetric_memory_backend()
 
         balanced = balanced_cls(
-            _make_config(
-                torch.float32,
-                1,
-                balanced=True,
-                expert_weight_backend="symmetric_memory",
-            ),
+            _make_config(torch.float32, 1, balanced=True, expert_weight_backend="symmetric_memory"),
             _submodules(),
             layer_number=1,
         )
@@ -503,10 +525,7 @@ def test_balanced_moe_layer_symmetric_memory_backend_fails_fast_when_unavailable
         with pytest.raises(RuntimeError, match="symmetric_memory expert-weight dispatch"):
             balanced_cls(
                 _make_config(
-                    torch.float32,
-                    1,
-                    balanced=True,
-                    expert_weight_backend="symmetric_memory",
+                    torch.float32, 1, balanced=True, expert_weight_backend="symmetric_memory"
                 ),
                 _submodules(),
                 layer_number=1,
@@ -530,12 +549,7 @@ def test_balanced_moe_layer_symmetric_memory_backend_parity(monkeypatch, mode):
         _set_random_seed(seed_=1234, data_parallel_random_init=False)
         baseline = MoELayer(_make_config(dtype, 1, balanced=False), _submodules(), layer_number=1)
         balanced = balanced_cls(
-            _make_config(
-                dtype,
-                1,
-                balanced=True,
-                expert_weight_backend="symmetric_memory",
-            ),
+            _make_config(dtype, 1, balanced=True, expert_weight_backend="symmetric_memory"),
             _submodules(),
             layer_number=1,
         )
@@ -565,11 +579,7 @@ def test_balanced_moe_layer_symmetric_memory_backend_parity(monkeypatch, mode):
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    "feature,planner_mode",
-    [
-        ("padding_mask", "no_move"),
-        ("shared_expert", "forced_move"),
-    ],
+    "feature,planner_mode", [("padding_mask", "no_move"), ("shared_expert", "forced_move")]
 )
 def test_balanced_moe_layer_padding_mask_and_shared_expert_parity(
     monkeypatch, feature, planner_mode
@@ -681,7 +691,9 @@ def test_balanced_moe_layer_te_grouped_parity(monkeypatch, mode, topk, dtype):
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(not HAVE_TE, reason="TEGroupedMLP runtime wgrad test requires Transformer Engine.")
+@pytest.mark.skipif(
+    not HAVE_TE, reason="TEGroupedMLP runtime wgrad test requires Transformer Engine."
+)
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0"),
     reason="TEGroupedMLP is only supported in TE 1.9.0.dev0 and later.",

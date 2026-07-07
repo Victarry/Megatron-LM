@@ -13,7 +13,6 @@ from typing import Literal, Union
 
 import torch
 
-
 AssignmentAlgorithm = Literal["one_shot_greedy", "approx_bin_packing"]
 
 
@@ -67,14 +66,11 @@ def _to_effective_order(
     spare = home_first_tensor[:, num_home_experts:].reshape(
         -1, num_ep_ranks, num_spare_experts // num_ep_ranks
     )
-    return torch.cat([home, spare], dim=-1).reshape(
-        -1, num_home_experts + num_spare_experts
-    )
+    return torch.cat([home, spare], dim=-1).reshape(-1, num_home_experts + num_spare_experts)
 
 
 def one_shot_greedy_assignment(
-    count_tokens_per_chunk: torch.Tensor,
-    capacity_per_bucket: torch.Tensor,
+    count_tokens_per_chunk: torch.Tensor, capacity_per_bucket: torch.Tensor
 ) -> torch.Tensor:
     """Assign token chunks to capacity buckets by cumulative interval overlap."""
 
@@ -154,9 +150,7 @@ def reclaim_spare_experts(
     max_allowed_load = avg_tokens_per_ep_rank + threshold
 
     count_tokens_after_offloading = count_tokens_per_home_rank - (
-        count_tokens_from_home_expert_to_spare_expert.sum(dim=1)
-        .view(num_ep_ranks, -1)
-        .sum(dim=1)
+        count_tokens_from_home_expert_to_spare_expert.sum(dim=1).view(num_ep_ranks, -1).sum(dim=1)
     )
 
     ep_rank_view = count_tokens_from_home_expert_to_spare_expert.view(
@@ -301,9 +295,7 @@ def gen_assignment(
         device=device,
         dtype=count_tokens_from_chunk_to_bucket_sorted.dtype,
     )
-    count_tokens_from_home_expert_to_spare_expert[indices_row, indices_col] = (
-        count_tokens_values
-    )
+    count_tokens_from_home_expert_to_spare_expert[indices_row, indices_col] = count_tokens_values
 
     if threshold_multiplier > 0:
         count_tokens_from_home_expert_to_spare_expert = reclaim_spare_experts(
@@ -399,16 +391,11 @@ def breadth_first_allocation(
         idx_supplier, torch.arange(assignment.shape[1], device=device)
     ] -= count_tokens_floors.sum(dim=0)
 
-    return (
-        count_tokens_floors,
-        count_tokens_per_expert_after_offload,
-        capacity_spare_remaining,
-    )
+    return (count_tokens_floors, count_tokens_per_expert_after_offload, capacity_spare_remaining)
 
 
 def depth_first_allocation(
-    count_tokens_per_expert_from_ep_rank: torch.Tensor,
-    capacity_spare_remaining: torch.Tensor,
+    count_tokens_per_expert_from_ep_rank: torch.Tensor, capacity_spare_remaining: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate remaining spare capacity by depth-first cumulative overlap."""
 
@@ -453,16 +440,10 @@ def reroute_tokens_eager(
     num_spare_experts = map_home_expert_to_spare.shape[1]
 
     rerouting_home_first = torch.zeros(
-        num_tokens,
-        num_home_experts + num_spare_experts,
-        dtype=torch.bool,
-        device=device,
+        num_tokens, num_home_experts + num_spare_experts, dtype=torch.bool, device=device
     )
     rerouted_probs_home_first = torch.zeros(
-        num_tokens,
-        num_home_experts + num_spare_experts,
-        dtype=probs_routing.dtype,
-        device=device,
+        num_tokens, num_home_experts + num_spare_experts, dtype=probs_routing.dtype, device=device
     )
     rerouting_home_first[:, :num_home_experts] = map_token_to_expert
     rerouted_probs_home_first[:, :num_home_experts] = probs_routing
@@ -536,10 +517,7 @@ def gen_offloading_plan_eager(
                 f"got {num_spare_experts_per_ep_rank}"
             )
         count_tokens_from_home_expert_to_spare_expert, _, _ = gen_assignment_for_approx_bp(
-            count_tokens_per_expert_from_ep_rank,
-            ep_rank,
-            num_ep_ranks,
-            dtype_index,
+            count_tokens_per_expert_from_ep_rank, ep_rank, num_ep_ranks, dtype_index
         )
     else:
         raise ValueError(
@@ -553,8 +531,7 @@ def gen_offloading_plan_eager(
     map_home_expert_to_spare = count_tokens_from_home_expert_to_spare_expert > 0
     first_pass, count_tokens_after_first_offload, capacity_spare_remaining = (
         breadth_first_allocation(
-            count_tokens_per_expert_from_ep_rank,
-            count_tokens_from_home_expert_to_spare_expert,
+            count_tokens_per_expert_from_ep_rank, count_tokens_from_home_expert_to_spare_expert
         )
     )
     second_pass, count_tokens_after_second_offload = depth_first_allocation(
@@ -649,9 +626,7 @@ rank_random_generator = None
 
 
 def generate_random_expert_offloading_map(
-    num_home_experts: int,
-    num_spare_experts: int,
-    device: torch.device,
+    num_home_experts: int, num_spare_experts: int, device: torch.device
 ) -> torch.Tensor:
     """Generate a deterministic random home-to-spare map for debug coverage."""
 
@@ -708,16 +683,10 @@ def gen_random_offloading_plan(
     )
 
     rerouting_home_first = torch.zeros(
-        num_tokens,
-        num_home_experts + num_spare_experts,
-        dtype=torch.bool,
-        device=device,
+        num_tokens, num_home_experts + num_spare_experts, dtype=torch.bool, device=device
     )
     rerouted_probs_home_first = torch.zeros(
-        num_tokens,
-        num_home_experts + num_spare_experts,
-        dtype=probs.dtype,
-        device=device,
+        num_tokens, num_home_experts + num_spare_experts, dtype=probs.dtype, device=device
     )
     rerouting_home_first[:, :num_home_experts] = routing_map
     rerouted_probs_home_first[:, :num_home_experts] = probs
@@ -744,10 +713,7 @@ def gen_random_offloading_plan(
         tokens_to_offload = token_indices[perm]
         spare_expert_idx = spare_expert_indices[
             torch.randint(
-                spare_expert_indices.numel(),
-                (1,),
-                device=device,
-                generator=rank_random_generator,
+                spare_expert_indices.numel(), (1,), device=device, generator=rank_random_generator
             ).item()
         ]
         spare_col = num_home_experts + int(spare_expert_idx.item())

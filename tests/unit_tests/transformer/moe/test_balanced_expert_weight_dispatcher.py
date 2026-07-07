@@ -60,10 +60,9 @@ def _cuda_event_latency_and_peak_delta_mb(
         result = fn()
     end.record()
     torch.cuda.synchronize()
-    peak_delta_mb = max(
-        torch.cuda.max_memory_allocated(device) - baseline_allocated,
-        0,
-    ) / (1024 * 1024)
+    peak_delta_mb = max(torch.cuda.max_memory_allocated(device) - baseline_allocated, 0) / (
+        1024 * 1024
+    )
     return start.elapsed_time(end) / iters, peak_delta_mb, result
 
 
@@ -111,6 +110,24 @@ def _require_symmetric_memory_expert_dispatcher():
     return dispatcher_cls
 
 
+def _require_hybridep_expert_dispatcher():
+    try:
+        module = importlib.import_module("megatron.core.transformer.moe.expert_weight_dispatcher")
+    except ModuleNotFoundError:
+        pytest.fail(
+            "megatron.core.transformer.moe.expert_weight_dispatcher is required for "
+            "BalancedMoELayer HybridEP dispatcher tests."
+        )
+    try:
+        dispatcher_cls = module.HybridEPExpertWeightDispatcher
+    except AttributeError:
+        pytest.fail("HybridEPExpertWeightDispatcher is required in expert_weight_dispatcher.py.")
+    availability_error = dispatcher_cls.availability_error()
+    if availability_error is not None:
+        pytest.skip(f"HybridEP expert dispatch is unavailable: {availability_error}")
+    return dispatcher_cls
+
+
 def _make_config(dtype):
     return TransformerConfig(
         num_layers=1,
@@ -138,7 +155,9 @@ def _make_home_weight(global_home_id, shape, dtype, device):
 
 def _gather_home_weights(local_home_weights, ep_group):
     local_stack = torch.stack([weight.detach() for weight in local_home_weights], dim=0)
-    gathered = [torch.empty_like(local_stack) for _ in range(torch.distributed.get_world_size(ep_group))]
+    gathered = [
+        torch.empty_like(local_stack) for _ in range(torch.distributed.get_world_size(ep_group))
+    ]
     torch.distributed.all_gather(gathered, local_stack, group=ep_group)
     return torch.cat(gathered, dim=0)
 
@@ -170,7 +189,9 @@ def _assert_inactive_or_expected(dispatched_weight, expected_weight, reference_s
     if expected_weight is None:
         assert dispatched_weight.shape == reference_shape
         assert dispatched_weight.dtype == dtype
-        torch.testing.assert_close(dispatched_weight, torch.zeros_like(dispatched_weight), rtol=0, atol=0)
+        torch.testing.assert_close(
+            dispatched_weight, torch.zeros_like(dispatched_weight), rtol=0, atol=0
+        )
         return
     torch.testing.assert_close(dispatched_weight, expected_weight, rtol=0, atol=0)
     assert dispatched_weight.dtype == dtype
@@ -192,6 +213,67 @@ def _run_dispatch_loss(dispatched, expert_map, ep_rank, spare_per_rank, dtype, d
             continue
         loss = loss + dispatched_weight.sum() * float(spare_global + 1)
     return loss
+
+
+def _expert_dispatch_payload_stats(metadata, ep_rank, weight_shape, dtype, device):
+    weight_numel = int(torch.Size(weight_shape).numel())
+    element_size = torch.empty((), dtype=dtype, device=device).element_size()
+    weight_bytes = weight_numel * element_size
+    local_remote_send_pairs = sum(
+        count for rank, count in enumerate(metadata.input_splits) if rank != ep_rank
+    )
+    local_remote_recv_pairs = sum(
+        count for rank, count in enumerate(metadata.output_splits) if rank != ep_rank
+    )
+
+    total_remote_pairs = torch.tensor(local_remote_send_pairs, dtype=torch.int64, device=device)
+    busiest_remote_pairs = torch.tensor(
+        max(local_remote_send_pairs, local_remote_recv_pairs), dtype=torch.int64, device=device
+    )
+    torch.distributed.all_reduce(total_remote_pairs, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(busiest_remote_pairs, op=torch.distributed.ReduceOp.MAX)
+
+    remote_payload_bytes = int(total_remote_pairs.item()) * weight_bytes
+    busiest_payload_bytes = int(busiest_remote_pairs.item()) * weight_bytes
+    logical_payload_bytes = int(metadata.global_routing_map.sum().item()) * weight_bytes
+    return remote_payload_bytes, busiest_payload_bytes, logical_payload_bytes
+
+
+def _gib_per_second(num_bytes, latency_ms):
+    if latency_ms <= 0.0:
+        return 0.0
+    return num_bytes / (latency_ms / 1000.0) / (1024**3)
+
+
+def _print_benchmark_line(
+    *,
+    case_name,
+    backend,
+    dtype,
+    weight_shape,
+    mean_ms,
+    max_ms,
+    mean_peak_mb,
+    max_peak_mb,
+    remote_payload_bytes,
+    busiest_payload_bytes,
+    logical_payload_bytes,
+):
+    print(
+        "BENCHMARK balanced_moe_expert_weight_dispatch "
+        f"case={case_name} backend={backend} "
+        f"dtype={dtype} weight_shape={tuple(weight_shape)} "
+        f"warmup_iters={_BENCHMARK_WARMUP_ITERS} iters={_BENCHMARK_ITERS} "
+        f"mean_rank_ms={mean_ms:.4f} max_rank_ms={max_ms:.4f} "
+        f"mean_peak_delta_mb={mean_peak_mb:.2f} max_peak_delta_mb={max_peak_mb:.2f} "
+        f"remote_payload_mib={remote_payload_bytes / (1024**2):.2f} "
+        f"remote_bw_gib_s={_gib_per_second(remote_payload_bytes, max_ms):.2f} "
+        f"busiest_rank_remote_mib={busiest_payload_bytes / (1024**2):.2f} "
+        f"busiest_rank_bw_gib_s={_gib_per_second(busiest_payload_bytes, max_ms):.2f} "
+        f"logical_payload_mib={logical_payload_bytes / (1024**2):.2f} "
+        f"logical_bw_gib_s={_gib_per_second(logical_payload_bytes, max_ms):.2f}",
+        flush=True,
+    )
 
 
 @pytest.mark.internal
@@ -368,16 +450,10 @@ def test_symmetric_memory_expert_weight_dispatch_matches_native(dtype):
 
         config = _make_config(dtype)
         native_dispatcher = native_dispatcher_cls(
-            config=config,
-            ep_group=pg_collection.ep,
-            num_home_experts=8,
-            num_spare_experts=8,
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
         )
         symm_dispatcher = symm_dispatcher_cls(
-            config=config,
-            ep_group=pg_collection.ep,
-            num_home_experts=8,
-            num_spare_experts=8,
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
         )
         native_dispatched = native_dispatcher.dispatch(
             native_dispatcher.preprocess(expert_map), *local_home_weights
@@ -415,16 +491,10 @@ def test_symmetric_memory_expert_weight_dispatch_grad_matches_native(dtype):
 
         config = _make_config(dtype)
         native_dispatcher = native_dispatcher_cls(
-            config=config,
-            ep_group=pg_collection.ep,
-            num_home_experts=8,
-            num_spare_experts=8,
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
         )
         symm_dispatcher = symm_dispatcher_cls(
-            config=config,
-            ep_group=pg_collection.ep,
-            num_home_experts=8,
-            num_spare_experts=8,
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
         )
         native_dispatched = native_dispatcher.dispatch(
             native_dispatcher.preprocess(expert_map), *native_home_weights
@@ -456,6 +526,180 @@ def test_symmetric_memory_expert_weight_dispatch_grad_matches_native(dtype):
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_hybridep_expert_weight_dispatch_matches_native(dtype):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        native_dispatcher_cls = _require_expert_dispatcher()
+        hybridep_dispatcher_cls = _require_hybridep_expert_dispatcher()
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        weight_shape = torch.Size([5, 6])
+        local_home_weights = [
+            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+            for local_idx in range(2)
+        ]
+        expert_map = _expert_offloading_map(device)
+
+        config = _make_config(dtype)
+        native_dispatcher = native_dispatcher_cls(
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
+        )
+        hybridep_dispatcher = hybridep_dispatcher_cls(
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
+        )
+        native_dispatched = native_dispatcher.dispatch(
+            native_dispatcher.preprocess(expert_map), *local_home_weights
+        )
+        hybridep_dispatched = hybridep_dispatcher.dispatch(
+            hybridep_dispatcher.preprocess(expert_map), *local_home_weights
+        )
+
+        for native_weight, hybridep_weight in zip(native_dispatched, hybridep_dispatched):
+            torch.testing.assert_close(hybridep_weight, native_weight, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_hybridep_expert_weight_dispatch_grad_matches_native(dtype):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        native_dispatcher_cls = _require_expert_dispatcher()
+        hybridep_dispatcher_cls = _require_hybridep_expert_dispatcher()
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        weight_shape = torch.Size([5, 6])
+        native_home_weights = [
+            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+            for local_idx in range(2)
+        ]
+        hybridep_home_weights = [
+            weight.detach().clone().requires_grad_(True) for weight in native_home_weights
+        ]
+        expert_map = _expert_offloading_map(device)
+
+        config = _make_config(dtype)
+        native_dispatcher = native_dispatcher_cls(
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
+        )
+        hybridep_dispatcher = hybridep_dispatcher_cls(
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
+        )
+        native_dispatched = native_dispatcher.dispatch(
+            native_dispatcher.preprocess(expert_map), *native_home_weights
+        )
+        hybridep_dispatched = hybridep_dispatcher.dispatch(
+            hybridep_dispatcher.preprocess(expert_map), *hybridep_home_weights
+        )
+
+        native_loss = _run_dispatch_loss(native_dispatched, expert_map, ep_rank, 2, dtype, device)
+        hybridep_loss = _run_dispatch_loss(
+            hybridep_dispatched, expert_map, ep_rank, 2, dtype, device
+        )
+        native_loss.backward()
+        hybridep_loss.backward()
+
+        for native_weight, hybridep_weight in zip(native_home_weights, hybridep_home_weights):
+            assert native_weight.grad is not None
+            assert hybridep_weight.grad is not None
+            if dtype is torch.bfloat16:
+                torch.testing.assert_close(
+                    hybridep_weight.grad, native_weight.grad, rtol=2e-2, atol=2e-2
+                )
+            else:
+                torch.testing.assert_close(
+                    hybridep_weight.grad, native_weight.grad, rtol=1e-5, atol=1e-6
+                )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_hybridep_expert_weight_dispatch_recompute_matches_native(monkeypatch, dtype):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        native_dispatcher_cls = _require_expert_dispatcher()
+        hybridep_dispatcher_cls = _require_hybridep_expert_dispatcher()
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        weight_shape = torch.Size([5, 6])
+        native_home_weights = [
+            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+            for local_idx in range(2)
+        ]
+        hybridep_home_weights = [
+            weight.detach().clone().requires_grad_(True) for weight in native_home_weights
+        ]
+        expert_map = _expert_offloading_map(device)
+        config = _make_config(dtype)
+
+        native_dispatcher = native_dispatcher_cls(
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
+        )
+        native_metadata = native_dispatcher.preprocess(expert_map)
+        native_dispatched = native_dispatcher.dispatch(native_metadata, *native_home_weights)
+        native_loss = _run_dispatch_loss(native_dispatched, expert_map, ep_rank, 2, dtype, device)
+        native_loss.backward()
+
+        hybridep_dispatcher = hybridep_dispatcher_cls(
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
+        )
+        hybridep_metadata = hybridep_dispatcher.preprocess(expert_map)
+        dispatch_calls = {"no_grad": 0, "grad": 0}
+        original_dispatch = hybridep_dispatcher_cls.dispatch
+
+        def counted_dispatch(self, metadata, *expert_weights):
+            if torch.is_grad_enabled():
+                dispatch_calls["grad"] += 1
+            else:
+                dispatch_calls["no_grad"] += 1
+            return original_dispatch(self, metadata, *expert_weights)
+
+        monkeypatch.setattr(hybridep_dispatcher_cls, "dispatch", counted_dispatch)
+        checkpoint = tensor_parallel.CheckpointWithoutOutput()
+
+        def checkpointed_dispatch(*weights):
+            return tuple(hybridep_dispatcher.dispatch(hybridep_metadata, *weights))
+
+        hybridep_dispatched = list(
+            checkpoint.checkpoint(checkpointed_dispatch, *hybridep_home_weights)
+        )
+        for native_weight, hybridep_weight in zip(native_dispatched, hybridep_dispatched):
+            torch.testing.assert_close(hybridep_weight, native_weight, rtol=0, atol=0)
+
+        hybridep_loss = _run_dispatch_loss(
+            hybridep_dispatched, expert_map, ep_rank, 2, dtype, device
+        )
+        checkpoint.discard_output_and_register_recompute(hybridep_loss)
+        hybridep_loss.backward()
+
+        for native_weight, hybridep_weight in zip(native_home_weights, hybridep_home_weights):
+            assert native_weight.grad is not None
+            assert hybridep_weight.grad is not None
+            if dtype is torch.bfloat16:
+                torch.testing.assert_close(
+                    hybridep_weight.grad, native_weight.grad, rtol=2e-2, atol=2e-2
+                )
+            else:
+                torch.testing.assert_close(
+                    hybridep_weight.grad, native_weight.grad, rtol=1e-5, atol=1e-6
+                )
+        assert dispatch_calls["no_grad"] == 1
+        assert dispatch_calls["grad"] == 1
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_symmetric_memory_expert_weight_dispatch_recompute_matches_native(monkeypatch, dtype):
     _require_distributed_cuda()
@@ -478,10 +722,7 @@ def test_symmetric_memory_expert_weight_dispatch_recompute_matches_native(monkey
         config = _make_config(dtype)
 
         native_dispatcher = native_dispatcher_cls(
-            config=config,
-            ep_group=pg_collection.ep,
-            num_home_experts=8,
-            num_spare_experts=8,
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
         )
         native_metadata = native_dispatcher.preprocess(expert_map)
         native_dispatched = native_dispatcher.dispatch(native_metadata, *native_home_weights)
@@ -489,10 +730,7 @@ def test_symmetric_memory_expert_weight_dispatch_recompute_matches_native(monkey
         native_loss.backward()
 
         symm_dispatcher = symm_dispatcher_cls(
-            config=config,
-            ep_group=pg_collection.ep,
-            num_home_experts=8,
-            num_spare_experts=8,
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
         )
         symm_metadata = symm_dispatcher.preprocess(expert_map)
         symm_dispatcher._get_workspace(symm_home_weights[0])
@@ -533,10 +771,7 @@ def test_symmetric_memory_expert_weight_dispatch_recompute_matches_native(monkey
                 torch.ops.symm_mem, "all_to_all_vdev_2d", forbidden_collective, raising=False
             )
             monkeypatch.setattr(
-                torch.ops.symm_mem,
-                "all_to_all_vdev_2d_offset",
-                forbidden_collective,
-                raising=False,
+                torch.ops.symm_mem, "all_to_all_vdev_2d_offset", forbidden_collective, raising=False
             )
 
         checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -622,10 +857,7 @@ def test_symmetric_memory_expert_weight_dispatch_uses_get_not_a2a(monkeypatch):
                 torch.ops.symm_mem, "all_to_all_vdev_2d", forbidden_collective, raising=False
             )
             monkeypatch.setattr(
-                torch.ops.symm_mem,
-                "all_to_all_vdev_2d_offset",
-                forbidden_collective,
-                raising=False,
+                torch.ops.symm_mem, "all_to_all_vdev_2d_offset", forbidden_collective, raising=False
             )
 
         metadata = dispatcher.preprocess(expert_map)
@@ -664,6 +896,7 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
         symm_dispatcher_cls = getattr(
             dispatcher_module, "SymmetricMemoryExpertWeightDispatcher", None
         )
+        hybridep_dispatcher_cls = getattr(dispatcher_module, "HybridEPExpertWeightDispatcher", None)
         pg_collection = get_default_pg_collection()
         ep_rank = pg_collection.ep.rank()
         global_rank = torch.distributed.get_rank()
@@ -677,12 +910,12 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
         config = _make_config(dtype)
 
         native_dispatcher = native_dispatcher_cls(
-            config=config,
-            ep_group=pg_collection.ep,
-            num_home_experts=8,
-            num_spare_experts=8,
+            config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
         )
         native_metadata = native_dispatcher.preprocess(expert_map)
+        remote_payload_bytes, busiest_payload_bytes, logical_payload_bytes = (
+            _expert_dispatch_payload_stats(native_metadata, ep_rank, weight_shape, dtype, device)
+        )
 
         def run_native_dispatch():
             with torch.no_grad():
@@ -699,15 +932,18 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
         )
 
         if global_rank == 0:
-            print(
-                "BENCHMARK balanced_moe_expert_weight_dispatch "
-                f"case={case_name} backend=native_all_to_all "
-                f"dtype={dtype} weight_shape={tuple(weight_shape)} "
-                f"warmup_iters={_BENCHMARK_WARMUP_ITERS} iters={_BENCHMARK_ITERS} "
-                f"mean_rank_ms={native_mean_ms:.4f} max_rank_ms={native_max_ms:.4f} "
-                f"mean_peak_delta_mb={native_mean_peak_mb:.2f} "
-                f"max_peak_delta_mb={native_max_peak_mb:.2f}",
-                flush=True,
+            _print_benchmark_line(
+                case_name=case_name,
+                backend="native_all_to_all",
+                dtype=dtype,
+                weight_shape=weight_shape,
+                mean_ms=native_mean_ms,
+                max_ms=native_max_ms,
+                mean_peak_mb=native_mean_peak_mb,
+                max_peak_mb=native_max_peak_mb,
+                remote_payload_bytes=remote_payload_bytes,
+                busiest_payload_bytes=busiest_payload_bytes,
+                logical_payload_bytes=logical_payload_bytes,
             )
 
         symm_error = None
@@ -719,10 +955,7 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
 
         if symm_error is None:
             symm_dispatcher = symm_dispatcher_cls(
-                config=config,
-                ep_group=pg_collection.ep,
-                num_home_experts=8,
-                num_spare_experts=8,
+                config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
             )
             symm_metadata = symm_dispatcher.preprocess(expert_map)
             symm_dispatcher._get_workspace(local_home_weights[0])
@@ -746,15 +979,18 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
             )
 
             if global_rank == 0:
-                print(
-                    "BENCHMARK balanced_moe_expert_weight_dispatch "
-                    f"case={case_name} backend=symmetric_memory "
-                    f"dtype={dtype} weight_shape={tuple(weight_shape)} "
-                    f"warmup_iters={_BENCHMARK_WARMUP_ITERS} iters={_BENCHMARK_ITERS} "
-                    f"mean_rank_ms={symm_mean_ms:.4f} max_rank_ms={symm_max_ms:.4f} "
-                    f"mean_peak_delta_mb={symm_mean_peak_mb:.2f} "
-                    f"max_peak_delta_mb={symm_max_peak_mb:.2f}",
-                    flush=True,
+                _print_benchmark_line(
+                    case_name=case_name,
+                    backend="symmetric_memory",
+                    dtype=dtype,
+                    weight_shape=weight_shape,
+                    mean_ms=symm_mean_ms,
+                    max_ms=symm_max_ms,
+                    mean_peak_mb=symm_mean_peak_mb,
+                    max_peak_mb=symm_max_peak_mb,
+                    remote_payload_bytes=remote_payload_bytes,
+                    busiest_payload_bytes=busiest_payload_bytes,
+                    logical_payload_bytes=logical_payload_bytes,
                 )
 
             for native_weight, symm_weight in zip(native_dispatched, symm_dispatched):
@@ -763,6 +999,57 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
             print(
                 "BENCHMARK balanced_moe_expert_weight_dispatch "
                 f"case={case_name} backend=symmetric_memory skipped reason={symm_error!r}",
+                flush=True,
+            )
+
+        hybridep_error = None
+        if hybridep_dispatcher_cls is None:
+            hybridep_error = "HybridEPExpertWeightDispatcher is unavailable"
+        else:
+            hybridep_error = hybridep_dispatcher_cls.availability_error()
+
+        if hybridep_error is None:
+            hybridep_dispatcher = hybridep_dispatcher_cls(
+                config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
+            )
+            hybridep_metadata = hybridep_dispatcher.preprocess(expert_map)
+
+            def run_hybridep_dispatch():
+                with torch.no_grad():
+                    return hybridep_dispatcher.dispatch(hybridep_metadata, *local_home_weights)
+
+            hybridep_latency_ms, hybridep_peak_delta_mb, hybridep_dispatched = (
+                _cuda_event_latency_and_peak_delta_mb(run_hybridep_dispatch, device)
+            )
+            assert hybridep_latency_ms > 0.0
+            hybridep_max_ms, hybridep_mean_ms = _distributed_float_stats(
+                hybridep_latency_ms, device
+            )
+            hybridep_max_peak_mb, hybridep_mean_peak_mb = _distributed_float_stats(
+                hybridep_peak_delta_mb, device
+            )
+
+            if global_rank == 0:
+                _print_benchmark_line(
+                    case_name=case_name,
+                    backend="hybridep",
+                    dtype=dtype,
+                    weight_shape=weight_shape,
+                    mean_ms=hybridep_mean_ms,
+                    max_ms=hybridep_max_ms,
+                    mean_peak_mb=hybridep_mean_peak_mb,
+                    max_peak_mb=hybridep_max_peak_mb,
+                    remote_payload_bytes=remote_payload_bytes,
+                    busiest_payload_bytes=busiest_payload_bytes,
+                    logical_payload_bytes=logical_payload_bytes,
+                )
+
+            for native_weight, hybridep_weight in zip(native_dispatched, hybridep_dispatched):
+                torch.testing.assert_close(hybridep_weight, native_weight, rtol=0, atol=0)
+        elif global_rank == 0:
+            print(
+                "BENCHMARK balanced_moe_expert_weight_dispatch "
+                f"case={case_name} backend=hybridep skipped reason={hybridep_error!r}",
                 flush=True,
             )
     finally:

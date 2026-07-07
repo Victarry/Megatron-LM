@@ -70,10 +70,16 @@ def undo_reroute(
     spare_per_rank = num_spare_experts // ep_size
 
     home_map = torch.zeros(
-        rerouting_map.shape[0], num_home_experts, dtype=rerouting_map.dtype, device=rerouting_map.device
+        rerouting_map.shape[0],
+        num_home_experts,
+        dtype=rerouting_map.dtype,
+        device=rerouting_map.device,
     )
     home_probs = torch.zeros(
-        rerouted_probs.shape[0], num_home_experts, dtype=rerouted_probs.dtype, device=rerouted_probs.device
+        rerouted_probs.shape[0],
+        num_home_experts,
+        dtype=rerouted_probs.dtype,
+        device=rerouted_probs.device,
     )
 
     for home_idx in range(num_home_experts):
@@ -83,7 +89,9 @@ def undo_reroute(
 
     home_indices, spare_indices = torch.where(expert_offloading_map)
     for home_idx, spare_idx in zip(home_indices.tolist(), spare_indices.tolist()):
-        effective_col = _effective_column_for_spare(spare_idx, ep_size, home_per_rank, spare_per_rank)
+        effective_col = _effective_column_for_spare(
+            spare_idx, ep_size, home_per_rank, spare_per_rank
+        )
         home_map[:, home_idx] |= rerouting_map[:, effective_col]
         home_probs[:, home_idx] += rerouted_probs[:, effective_col]
 
@@ -93,7 +101,9 @@ def undo_reroute(
 def _make_local_routing(ep_size: int, topk: int, dtype: torch.dtype, device: torch.device):
     num_home_experts = 8
     tokens_per_rank = 12
-    routing = torch.zeros(ep_size, tokens_per_rank, num_home_experts, dtype=torch.bool, device=device)
+    routing = torch.zeros(
+        ep_size, tokens_per_rank, num_home_experts, dtype=torch.bool, device=device
+    )
     probs = torch.zeros(ep_size, tokens_per_rank, num_home_experts, dtype=dtype, device=device)
 
     for ep_rank in range(ep_size):
@@ -139,12 +149,7 @@ def _make_routing_from_counts(
 
 
 def _assert_equivalent_plan(
-    original_map,
-    original_probs,
-    rerouting_map,
-    rerouted_probs,
-    expert_offloading_map,
-    ep_size,
+    original_map, original_probs, rerouting_map, rerouted_probs, expert_offloading_map, ep_size
 ):
     restored_map, restored_probs = undo_reroute(
         rerouting_map, rerouted_probs, expert_offloading_map, ep_size=ep_size
@@ -159,10 +164,7 @@ def _assert_equivalent_plan(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="offloading planner uses CUDA kernels")
 @pytest.mark.parametrize(
     "topk,assignment_algorithm,spare_per_ep",
-    [
-        (1, "approx_bin_packing", 1),
-        (2, "one_shot_greedy", 2),
-    ],
+    [(1, "approx_bin_packing", 1), (2, "one_shot_greedy", 2)],
 )
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16])
 def test_offloading_planner_equivalence(topk, assignment_algorithm, spare_per_ep, dtype):
@@ -197,7 +199,9 @@ def test_offloading_planner_equivalence(topk, assignment_algorithm, spare_per_ep
 
     assert all(torch.equal(offloading_maps[0], m) for m in offloading_maps[1:])
 
-    before_rank_load = routing.reshape(-1, routing.shape[-1]).sum(dim=0).reshape(ep_size, -1).sum(dim=1)
+    before_rank_load = (
+        routing.reshape(-1, routing.shape[-1]).sum(dim=0).reshape(ep_size, -1).sum(dim=1)
+    )
     effective = torch.cat(rerouting_by_rank, dim=0)
     effective_per_rank = routing.shape[-1] // ep_size + spare_per_ep
     after_rank_load = effective.sum(dim=0).reshape(ep_size, effective_per_rank).sum(dim=1)
@@ -243,12 +247,7 @@ def test_random_offloading_equivalence():
     counts = routing.sum(dim=1).to(torch.int32)
 
     rerouting_map, rerouted_probs, expert_offloading_map = planner.gen_random_offloading_plan(
-        routing[0],
-        probs[0],
-        counts,
-        ep_rank=0,
-        ep=ep_size,
-        spare_expert_per_ep_rank=1,
+        routing[0], probs[0], counts, ep_rank=0, ep=ep_size, spare_expert_per_ep_rank=1
     )
     _assert_equivalent_plan(
         routing[0], probs[0], rerouting_map, rerouted_probs, expert_offloading_map, ep_size

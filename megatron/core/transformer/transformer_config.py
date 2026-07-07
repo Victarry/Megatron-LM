@@ -898,9 +898,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_balance_recompute_expert_dispatch: bool = False
     """Recompute BalancedMoELayer dispatched spare expert weights during backward."""
 
-    moe_balance_expert_weight_dispatch_backend: Literal["all_to_all", "symmetric_memory"] = (
-        "all_to_all"
-    )
+    moe_balance_expert_weight_dispatch_backend: Literal[
+        "all_to_all", "symmetric_memory", "hybridep"
+    ] = "all_to_all"
     """Expert-weight dispatch backend for BalancedMoELayer runtime spare weights."""
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
@@ -1895,11 +1895,12 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_balance_expert_weight_dispatch_backend not in (
                 "all_to_all",
                 "symmetric_memory",
+                "hybridep",
             ):
                 raise ValueError(
                     "BalancedMoELayer requires "
                     "moe_balance_expert_weight_dispatch_backend to be one of "
-                    "'all_to_all' or 'symmetric_memory'."
+                    "'all_to_all', 'symmetric_memory', or 'hybridep'."
                 )
             if self.num_moe_experts is None:
                 raise ValueError("BalancedMoELayer requires num_moe_experts.")
@@ -1908,9 +1909,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.expert_model_parallel_size <= 1:
                 raise ValueError("BalancedMoELayer requires expert_model_parallel_size > 1.")
             if self.num_moe_experts % self.expert_model_parallel_size != 0:
-                raise ValueError(
-                    "BalancedMoELayer requires num_moe_experts divisible by EP size."
-                )
+                raise ValueError("BalancedMoELayer requires num_moe_experts divisible by EP size.")
             if self.moe_num_spare_experts is None or self.moe_num_spare_experts <= 0:
                 raise ValueError("BalancedMoELayer requires a positive moe_num_spare_experts.")
             if self.moe_num_spare_experts % self.expert_model_parallel_size != 0:
@@ -1932,9 +1931,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.fp8 is not None or self.fp4 is not None:
                 raise ValueError("BalancedMoELayer does not support FP8 or FP4 in the MVP.")
             if self.moe_router_padding_for_fp8 or self.moe_router_padding_for_quantization:
-                raise ValueError(
-                    "BalancedMoELayer does not support quantization router padding."
-                )
+                raise ValueError("BalancedMoELayer does not support quantization router padding.")
             if self.transformer_impl == "inference_optimized":
                 raise ValueError("BalancedMoELayer does not support inference_optimized.")
             if self.expert_tensor_parallel_size != 1:
@@ -1946,15 +1943,11 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_shared_expert_overlap:
                 raise ValueError("BalancedMoELayer does not support shared expert overlap.")
             if self.overlap_moe_expert_parallel_comm:
-                raise ValueError(
-                    "BalancedMoELayer does not support MoE EP communication overlap."
-                )
+                raise ValueError("BalancedMoELayer does not support MoE EP communication overlap.")
             if self.delay_wgrad_compute:
                 raise ValueError("BalancedMoELayer does not support delayed wgrad compute.")
             if self.overlap_dispatch_backward_with_experts_wgrad:
-                raise ValueError(
-                    "BalancedMoELayer does not support dispatch-backward overlap."
-                )
+                raise ValueError("BalancedMoELayer does not support dispatch-backward overlap.")
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":

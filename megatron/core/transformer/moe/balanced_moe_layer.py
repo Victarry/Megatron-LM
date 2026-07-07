@@ -17,6 +17,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.expert_weight_dispatcher import (
     AllToAllExpertWeightDispatcher,
+    HybridEPExpertWeightDispatcher,
     SymmetricMemoryExpertWeightDispatcher,
 )
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoESubmodules
@@ -72,9 +73,7 @@ class BalancedMoELayer(BaseMoELayer):
         self.num_spare_experts = not_none(getattr(self.config, "moe_num_spare_experts", None))
         self.num_local_home_experts = self.num_home_experts // self.ep_size
         self.num_local_spare_experts = self.num_spare_experts // self.ep_size
-        self.num_local_total_experts = (
-            self.num_local_home_experts + self.num_local_spare_experts
-        )
+        self.num_local_total_experts = self.num_local_home_experts + self.num_local_spare_experts
         self.num_total_experts = self.num_home_experts + self.num_spare_experts
         self.local_home_expert_indices = list(range(self.num_local_home_experts))
         self.local_spare_expert_indices = list(
@@ -138,9 +137,7 @@ class BalancedMoELayer(BaseMoELayer):
             return True
 
     def _make_expert_weight_dispatcher(self):
-        backend = getattr(
-            self.config, "moe_balance_expert_weight_dispatch_backend", "all_to_all"
-        )
+        backend = getattr(self.config, "moe_balance_expert_weight_dispatch_backend", "all_to_all")
         dispatcher_kwargs = {
             "config": self.config,
             "ep_group": self.ep_group,
@@ -157,9 +154,17 @@ class BalancedMoELayer(BaseMoELayer):
                     f"{availability_error}"
                 )
             return SymmetricMemoryExpertWeightDispatcher(**dispatcher_kwargs)
+        if backend == "hybridep":
+            availability_error = HybridEPExpertWeightDispatcher.availability_error()
+            if availability_error is not None:
+                raise RuntimeError(
+                    "BalancedMoELayer hybridep expert-weight dispatch is unavailable: "
+                    f"{availability_error}"
+                )
+            return HybridEPExpertWeightDispatcher(**dispatcher_kwargs)
         raise ValueError(
             "BalancedMoELayer requires moe_balance_expert_weight_dispatch_backend to be "
-            "'all_to_all' or 'symmetric_memory'."
+            "'all_to_all', 'symmetric_memory', or 'hybridep'."
         )
 
     @staticmethod
@@ -169,10 +174,11 @@ class BalancedMoELayer(BaseMoELayer):
         if getattr(config, "moe_balance_expert_weight_dispatch_backend", "all_to_all") not in (
             "all_to_all",
             "symmetric_memory",
+            "hybridep",
         ):
             raise ValueError(
                 "BalancedMoELayer requires moe_balance_expert_weight_dispatch_backend "
-                "to be 'all_to_all' or 'symmetric_memory'."
+                "to be 'all_to_all', 'symmetric_memory', or 'hybridep'."
             )
         if config.num_moe_experts is None:
             raise ValueError("BalancedMoELayer requires num_moe_experts.")
@@ -186,7 +192,9 @@ class BalancedMoELayer(BaseMoELayer):
         if num_spare_experts is None or num_spare_experts <= 0:
             raise ValueError("BalancedMoELayer requires a positive moe_num_spare_experts.")
         if num_spare_experts % config.expert_model_parallel_size != 0:
-            raise ValueError("BalancedMoELayer requires moe_num_spare_experts divisible by EP size.")
+            raise ValueError(
+                "BalancedMoELayer requires moe_num_spare_experts divisible by EP size."
+            )
         if config.moe_token_dispatcher_type != "alltoall":
             raise ValueError("BalancedMoELayer requires moe_token_dispatcher_type='alltoall'.")
         spare_per_rank = num_spare_experts // config.expert_model_parallel_size
@@ -292,9 +300,7 @@ class BalancedMoELayer(BaseMoELayer):
             )
         if not torch.equal(rerouting_map.sum(dim=1), routing_map.sum(dim=1)):
             raise ValueError("BalancedMoELayer planner changed per-token assignment counts.")
-        torch.testing.assert_close(
-            rerouted_probs.sum(dim=1), probs.sum(dim=1), rtol=0, atol=1e-6
-        )
+        torch.testing.assert_close(rerouted_probs.sum(dim=1), probs.sum(dim=1), rtol=0, atol=1e-6)
 
     def _install_spare_expert_weights(
         self, expert_offloading_map: torch.Tensor
@@ -303,9 +309,7 @@ class BalancedMoELayer(BaseMoELayer):
         checkpoints: list[tensor_parallel.CheckpointWithoutOutput] = []
         recompute_dispatch = getattr(self.config, "moe_balance_recompute_expert_dispatch", False)
         for module in ("fc1", "fc2"):
-            home_weights = self.experts.get_expert_weights(
-                module, self.local_home_expert_indices
-            )
+            home_weights = self.experts.get_expert_weights(module, self.local_home_expert_indices)
             if recompute_dispatch:
                 checkpoint = tensor_parallel.CheckpointWithoutOutput()
                 spare_weights = list(
@@ -362,9 +366,9 @@ class BalancedMoELayer(BaseMoELayer):
             effective_counts = torch.stack(gathered, dim=0)
 
         global_home_counts = tokens_per_expert_from_ep_rank.sum(dim=0)
-        before_rank_load = global_home_counts.reshape(self.ep_size, self.num_local_home_experts).sum(
-            dim=1
-        )
+        before_rank_load = global_home_counts.reshape(
+            self.ep_size, self.num_local_home_experts
+        ).sum(dim=1)
         global_effective_counts = effective_counts.sum(dim=0)
         after_rank_load = global_effective_counts.reshape(
             self.ep_size, self.num_local_total_experts
@@ -458,12 +462,16 @@ class BalancedMoELayer(BaseMoELayer):
         return output, None
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
+        """Run delayed weight-gradient computation for local expert modules."""
+
         if routed_experts:
             self.experts.backward_dw()
         if shared_experts and self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()
 
     def _is_spare_state_key(self, key: str) -> bool:
+        """Return whether a state-dict key belongs to a runtime spare expert."""
+
         for expert_index in self.local_spare_expert_indices:
             if f"experts.local_experts.{expert_index}." in key:
                 return True
@@ -474,6 +482,8 @@ class BalancedMoELayer(BaseMoELayer):
         return False
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
+        """Return a checkpoint-compatible state dict without spare expert weights."""
+
         state_dict = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
         for key in list(state_dict.keys()):
             if self._is_spare_state_key(key):
@@ -481,6 +491,8 @@ class BalancedMoELayer(BaseMoELayer):
         return state_dict
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load a home-expert checkpoint while materializing local spare keys."""
+
         if not strict:
             return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
@@ -494,9 +506,13 @@ class BalancedMoELayer(BaseMoELayer):
         return super().load_state_dict(augmented_state_dict, strict=True, assign=assign)
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Return a sharded state dict that is compatible with standard MoELayer keys."""
+
         original_values = []
         if hasattr(self.experts, "num_local_experts"):
-            original_values.append((self.experts, "num_local_experts", self.experts.num_local_experts))
+            original_values.append(
+                (self.experts, "num_local_experts", self.experts.num_local_experts)
+            )
             self.experts.num_local_experts = self.num_local_home_experts
         for layer_name in ("linear_fc1", "linear_fc2"):
             expert_layer = getattr(self.experts, layer_name, None)
@@ -514,6 +530,8 @@ class BalancedMoELayer(BaseMoELayer):
                 setattr(module, attribute, value)
 
     def set_for_recompute_pre_mlp_layernorm(self):
+        """Mark shared-expert TE layers to preserve inputs needed by recompute."""
+
         if self.shared_experts is not None:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 

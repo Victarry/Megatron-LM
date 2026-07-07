@@ -991,10 +991,7 @@ class TEGroupedMLP(MegatronModule):
         return [getattr(expert_layer, f"weight{expert_index}") for expert_index in expert_indices]
 
     def set_expert_weights(
-        self,
-        module: str,
-        expert_weights: list[torch.Tensor],
-        expert_indices: list[int],
+        self, module: str, expert_weights: list[torch.Tensor], expert_indices: list[int]
     ) -> None:
         """Attach dispatched runtime weights to local spare expert slots."""
 
@@ -1517,10 +1514,7 @@ class SequentialMLP(MegatronModule):
         ]
 
     def set_expert_weights(
-        self,
-        module: str,
-        expert_weights: list[torch.Tensor],
-        expert_indices: list[int],
+        self, module: str, expert_weights: list[torch.Tensor], expert_indices: list[int]
     ) -> None:
         """Attach dispatched runtime weights to local spare expert slots."""
 
