@@ -1,11 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+from megatron.core.transformer.moe import ultraep_manager
 from megatron.core.transformer.moe.experts import TEGroupedMLP, _parse_te_expert_idx
 from megatron.core.transformer.moe.ultraep_manager import UltraEPManager
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -130,3 +132,27 @@ def test_ultraep_manager_preserves_one_based_mcore_layer_ids():
     assert manager.layer_id(2) == 2
     with pytest.raises(ValueError, match="must be in"):
         manager.layer_id(0)
+
+
+def test_destroy_ultraep_managers_closes_and_clears_registry():
+    manager_a = SimpleNamespace(close=Mock())
+    manager_b = SimpleNamespace(close=Mock())
+    ultraep_manager._ULTRAEP_MANAGER_REGISTRY.update({1: manager_a, 2: manager_b})
+
+    ultraep_manager.destroy_ultraep_managers()
+
+    manager_a.close.assert_called_once_with()
+    manager_b.close.assert_called_once_with()
+    assert ultraep_manager._ULTRAEP_MANAGER_REGISTRY == {}
+
+
+def test_ultraep_manager_close_is_idempotent():
+    manager = UltraEPManager.__new__(UltraEPManager)
+    manager.runtime = SimpleNamespace(destroy=Mock())
+    manager._closed = False
+
+    manager.close()
+    manager.close()
+
+    manager.runtime.destroy.assert_called_once_with()
+    assert manager._closed

@@ -320,7 +320,9 @@ Install UltraEP and its matching NVSHMEM runtime in the training container, then
 The current integration supports BF16 training with MCore DDP, TE per-expert GroupedLinear
 weights, ETP1, dropless routing, `alltoall` or `flex` dispatch, and DP/PP/VPP. Replica gradients
 are reduced synchronously before deferred master gradients are released to DDP, prioritizing
-correct microbatch ordering; async overlap can be added independently later.
+correct microbatch ordering; async overlap can be added independently later. At normal training
+shutdown MCore explicitly destroys the shared UltraEP managers, flushing load-profiler records
+before Python shuts down its background thread pool.
 
 The configuration validator rejects unsupported combinations, including FP8/FP4 experts, FSDP,
 MTP, latent MoE, single grouped expert weights, CUDA graphs, inference-optimized layers, the TE

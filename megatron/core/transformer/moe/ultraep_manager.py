@@ -85,11 +85,12 @@ class UltraEPManager:
             expert_fc1_numel=self.expert_fc1_numel,
             expert_fc2_numel=self.expert_fc2_numel,
             is_train=True,
-            explicitly_destroy=False,
+            explicitly_destroy=True,
             max_microbatches=self.max_microbatches,
             weight_data_dtype=config.params_dtype,
             grad_dtype=torch.float32,
         )
+        self._closed = False
 
         self.local_replica_fc1_weight_buffer = self.runtime.local_replica_fc1_weight_buffer
         self.local_replica_fc2_weight_buffer = self.runtime.local_replica_fc2_weight_buffer
@@ -155,6 +156,13 @@ class UltraEPManager:
         """Reduce replica gradients back into their logical master experts."""
         return self.runtime.grad_reduce(virtual_layer_id, async_finish=async_finish)
 
+    def close(self) -> None:
+        """Flush profiling data and release the UltraEP runtime exactly once."""
+        if self._closed:
+            return
+        self.runtime.destroy()
+        self._closed = True
+
 
 _ULTRAEP_MANAGER_REGISTRY: dict[int, UltraEPManager] = {}
 
@@ -194,4 +202,11 @@ def get_or_create_ultraep_manager(
 
 def clear_ultraep_manager_registry() -> None:
     """Drop Python references to cached UltraEP managers (primarily for tests)."""
+    _ULTRAEP_MANAGER_REGISTRY.clear()
+
+
+def destroy_ultraep_managers() -> None:
+    """Flush and destroy all UltraEP runtimes before Python worker shutdown."""
+    for manager in _ULTRAEP_MANAGER_REGISTRY.values():
+        manager.close()
     _ULTRAEP_MANAGER_REGISTRY.clear()
