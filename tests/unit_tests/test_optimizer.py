@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from unittest.mock import patch
@@ -97,6 +97,21 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
     assert pg0['is_decoupled_lr'] == False
     assert pg0['max_lr'] == 0.01  # from the optimizer config default for lr
     assert pg0['min_lr'] is None  # from the optimizer config default.
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_excludes_ultraep_replicas(mock_get_world_size):
+    net = Net()
+    net.fc3.weight._ultraep_is_replica = True
+
+    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), {})
+    optimizer_params = {param for group in param_groups for param in group['params']}
+
+    assert net.fc3.weight not in optimizer_params
+    assert optimizer_params == set(net.parameters()) - {net.fc3.weight}
 
 
 @patch('torch.distributed.get_world_size', return_value=1)

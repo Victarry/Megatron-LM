@@ -300,6 +300,34 @@ Routers determine which expert(s) handle each token. A lightweight MLP scores ev
 | **aux loss free** | Dynamic bias-based load balancing strategy without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3`|
 | **none** | No load balancing | `--moe-router-load-balancing-type none` |
 
+#### UltraEP Online Expert Replication
+
+[UltraEP](https://github.com/Dots-Infra/UltraEP) balances the exact post-router load of each
+microbatch. It reserves physical replica slots on every EP rank, replicates hot logical experts,
+and expands the routing map before token dispatch. Replica weight and gradient storage is reused
+across layers; replicas are excluded from DDP, optimizer state, and distributed checkpoints.
+
+Install UltraEP and its matching NVSHMEM runtime in the training container, then enable it with:
+
+```bash
+--moe-enable-ultraep
+--moe-num-redundant-experts-per-rank 2
+--moe-token-dispatcher-type alltoall
+--moe-grouped-gemm
+--accumulate-allreduce-grads-in-fp32
+```
+
+The current integration supports BF16 training with MCore DDP, TE per-expert GroupedLinear
+weights, ETP1, dropless routing, `alltoall` or `flex` dispatch, and DP/PP/VPP. Replica gradients
+are reduced synchronously before deferred master gradients are released to DDP, prioritizing
+correct microbatch ordering; async overlap can be added independently later.
+
+The configuration validator rejects unsupported combinations, including FP8/FP4 experts, FSDP,
+MTP, latent MoE, single grouped expert weights, CUDA graphs, inference-optimized layers, the TE
+operation fuser, batch-level EP overlap, and delayed expert wgrad overlap. UltraEP requires SM90
+or SM100 GPUs with NVLink, Python 3.10+, PyTorch 2.10+, and the matching CUDA 12/13 NVSHMEM 3.4.5
+wheel.
+
 ### Token Dispatching
 
 After routing, tokens are **dispatched** to the GPU hosting the assigned expert. After expert computation, tokens are sent back and **combined** to restore the original sequence.
@@ -537,6 +565,8 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-fusion | Enable router fusion | False |
 | --moe-router-dtype | Router precision: fp32, fp64 | None |
 | --moe-router-padding-for-fp8 | Pad for FP8 alignment | False |
+| --moe-enable-ultraep | Enable per-microbatch online expert replication | False |
+| --moe-num-redundant-experts-per-rank | Physical UltraEP replica slots on each EP rank | 0 |
 
 ### Loss and Regularization
 | Argument | Description | Default |
