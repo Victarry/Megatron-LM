@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Model and data parallel groups."""
 
@@ -2106,6 +2106,14 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # MoonEP VMM mappings synchronize through the EP group during teardown.
+    try:
+        from megatron.core.transformer.moe.moonep_backend import close_moonep_runtimes
+
+        close_moonep_runtimes()
+    except ImportError:
+        pass
+
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
