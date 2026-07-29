@@ -72,6 +72,7 @@ def _config(num_experts, *, moonep, shared_expert=False):
         gated_linear_unit=True,
         use_transformer_engine_op_fuser=True,
         moe_mlp_glu_interleave_size=32,
+        gradient_accumulation_fusion=True,
     )
     if shared_expert:
         config.moe_shared_expert_intermediate_size = 512
@@ -96,6 +97,12 @@ def _zero_layer_grads(layer):
             main_grad.zero_()
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = False
+
+
+def _enable_fp32_main_grads(module):
+    for param in module.parameters():
+        param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+        param.grad_added_to_main_grad = False
 
 
 def _sharded_metadata(state_dict):
@@ -499,6 +506,13 @@ def test_balanced_moe_moonep_full_layer_parity_refresh_and_state_dict():
         )
         baseline.cuda().to(dtype=torch.bfloat16)
         balanced.cuda().to(dtype=torch.bfloat16)
+        for module in (
+            baseline.experts,
+            baseline.shared_experts,
+            balanced.experts,
+            balanced.shared_experts,
+        ):
+            _enable_fp32_main_grads(module)
         assert baseline.state_dict().keys() == balanced.state_dict().keys()
         balanced.load_state_dict(baseline.state_dict(), strict=True)
         baseline_sharded = _sharded_metadata(baseline.sharded_state_dict())
