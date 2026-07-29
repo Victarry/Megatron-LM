@@ -602,9 +602,6 @@ class MoonEPBalancedDataPlane:
         route_weights, expert_ids, tokens_per_expert = adapt_mcore_route(
             probs, routing_map, self.config.moe_router_topk
         )
-        if refresh_shadow or self.grouped_mlp.table is None:
-            self.grouped_mlp.refresh_shadow()
-
         runtime = MoonEPRuntimeRegistry.get(
             config=self.config,
             group=self.group,
@@ -615,6 +612,9 @@ class MoonEPBalancedDataPlane:
             num_experts=self.num_experts,
             num_spare_experts=self.num_spare_experts,
         )
+        if refresh_shadow or self.grouped_mlp.table is None:
+            self.grouped_mlp.refresh_shadow()
+
         dispatched_hidden, dispatched_probs, cu_seqlens, plan = (
             runtime.dispatch_and_prefetch(
                 hidden_2d,
