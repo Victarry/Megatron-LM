@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import importlib
+import math
 import os
+import time
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -14,10 +17,18 @@ from tests.unit_tests.test_utilities import Utils
 _BENCHMARK_WARMUP_ITERS = 5
 _BENCHMARK_ITERS = 20
 _BENCHMARK_WEIGHT_CASES = [
-    ("small_regression", torch.Size([256, 512])),
     ("representative_fc1_proxy", torch.Size([4096, 2048])),
     ("representative_fc2_proxy", torch.Size([2048, 4096])),
 ]
+
+
+@dataclass(frozen=True)
+class _RoutePayloadStats:
+    normalized_remote_payload_bytes: int
+    busiest_send_payload_bytes: int
+    busiest_recv_payload_bytes: int
+    busiest_send_plus_recv_payload_bytes: int
+    logical_payload_bytes: int
 
 
 def _require_distributed_cuda(world_size=4):
@@ -56,14 +67,47 @@ def _cuda_event_latency_and_peak_delta_mb(
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
+    wall_start = time.perf_counter()
     for _ in range(iters):
         result = fn()
     end.record()
     torch.cuda.synchronize()
+    wall_ms = (time.perf_counter() - wall_start) * 1000.0 / iters
     peak_delta_mb = max(torch.cuda.max_memory_allocated(device) - baseline_allocated, 0) / (
         1024 * 1024
     )
-    return start.elapsed_time(end) / iters, peak_delta_mb, result
+    return start.elapsed_time(end) / iters, wall_ms, peak_delta_mb, result
+
+
+def _cuda_event_backward_latency_and_peak_delta_mb(
+    make_loss, device, *, warmup_iters=_BENCHMARK_WARMUP_ITERS, iters=_BENCHMARK_ITERS
+):
+    result = None
+    for _ in range(warmup_iters):
+        loss, result = make_loss()
+        loss.backward()
+    torch.cuda.synchronize()
+
+    baseline_allocated = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    event_ms_total = 0.0
+    wall_ms_total = 0.0
+    for _ in range(iters):
+        loss, result = make_loss()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        wall_start = time.perf_counter()
+        loss.backward()
+        end.record()
+        torch.cuda.synchronize()
+        wall_ms_total += (time.perf_counter() - wall_start) * 1000.0
+        event_ms_total += start.elapsed_time(end)
+    peak_delta_mb = max(torch.cuda.max_memory_allocated(device) - baseline_allocated, 0) / (
+        1024 * 1024
+    )
+    return event_ms_total / iters, wall_ms_total / iters, peak_delta_mb, result
 
 
 def _distributed_float_stats(local_value, device):
@@ -74,6 +118,15 @@ def _distributed_float_stats(local_value, device):
     torch.distributed.all_reduce(sum_value, op=torch.distributed.ReduceOp.SUM)
     mean_value = sum_value / torch.distributed.get_world_size()
     return max_value.item(), mean_value.item()
+
+
+def _distributed_int_stats(local_value, device, group=None):
+    local = torch.tensor(local_value, dtype=torch.int64, device=device)
+    max_value = local.clone()
+    sum_value = local.clone()
+    torch.distributed.all_reduce(max_value, op=torch.distributed.ReduceOp.MAX, group=group)
+    torch.distributed.all_reduce(sum_value, op=torch.distributed.ReduceOp.SUM, group=group)
+    return int(max_value.item()), int(sum_value.item())
 
 
 def _require_expert_dispatcher():
@@ -128,8 +181,8 @@ def _require_hybridep_expert_dispatcher():
     return dispatcher_cls
 
 
-def _make_config(dtype):
-    return TransformerConfig(
+def _make_config(dtype, *, grad_combine_dtype="fp32"):
+    config = TransformerConfig(
         num_layers=1,
         hidden_size=6,
         num_attention_heads=2,
@@ -145,6 +198,8 @@ def _make_config(dtype):
         bf16=dtype is torch.bfloat16,
         fp16=dtype is torch.float16,
     )
+    config.moe_balance_expert_weight_grad_combine_dtype = grad_combine_dtype
+    return config
 
 
 def _make_home_weight(global_home_id, shape, dtype, device):
@@ -170,6 +225,27 @@ def _expert_offloading_map(device):
     expert_map[0, 4] = True
     expert_map[7, 7] = True
     return expert_map
+
+
+def _alternate_expert_offloading_map(device):
+    expert_map = torch.zeros(8, 8, dtype=torch.bool, device=device)
+    expert_map[1, 0] = True
+    expert_map[4, 1] = True
+    expert_map[2, 3] = True
+    expert_map[7, 4] = True
+    expert_map[5, 6] = True
+    return expert_map
+
+
+def _single_home_all_spares_offloading_map(device):
+    expert_map = torch.zeros(8, 8, dtype=torch.bool, device=device)
+    expert_map[0, :] = True
+    return expert_map
+
+
+def _fp32_combine_probe_spare_grad(spare_idx, weight_shape, dtype, device):
+    value = 256.0 if spare_idx == 0 else 1.0
+    return torch.full(weight_shape, value, dtype=dtype, device=device)
 
 
 def _expected_local_spare_weights(expert_map, gathered_home_weights, ep_rank, spare_per_rank):
@@ -205,6 +281,22 @@ def _expected_home_grads(expert_map, weight_shape, dtype, device):
     return expected
 
 
+def _expected_home_grads_from_spare_grads(expert_map, weight_shape, device):
+    expected_fp32 = torch.zeros((8, *weight_shape), dtype=torch.float32, device=device)
+    expected_bf16_sequential = torch.zeros(
+        (8, *weight_shape), dtype=torch.bfloat16, device=device
+    )
+    for home_idx, spare_idx in zip(*torch.where(expert_map)):
+        spare_idx = int(spare_idx.item())
+        home_idx = int(home_idx.item())
+        spare_grad = _fp32_combine_probe_spare_grad(
+            spare_idx, weight_shape, torch.bfloat16, device
+        )
+        expected_fp32[home_idx].add_(spare_grad.float())
+        expected_bf16_sequential[home_idx].add_(spare_grad)
+    return expected_fp32, expected_bf16_sequential
+
+
 def _run_dispatch_loss(dispatched, expert_map, ep_rank, spare_per_rank, dtype, device):
     loss = torch.zeros((), dtype=dtype, device=device)
     for local_spare_idx, dispatched_weight in enumerate(dispatched):
@@ -215,10 +307,57 @@ def _run_dispatch_loss(dispatched, expert_map, ep_rank, spare_per_rank, dtype, d
     return loss
 
 
-def _expert_dispatch_payload_stats(metadata, ep_rank, weight_shape, dtype, device):
+def _weight_payload_bytes(weight_shape, dtype, device):
     weight_numel = int(torch.Size(weight_shape).numel())
     element_size = torch.empty((), dtype=dtype, device=device).element_size()
-    weight_bytes = weight_numel * element_size
+    return weight_numel * element_size
+
+
+def _global_payload_bytes(local_pair_count, bytes_per_pair, device):
+    global_pair_count = torch.tensor(local_pair_count, dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(global_pair_count, op=torch.distributed.ReduceOp.SUM)
+    return int(global_pair_count.item()) * bytes_per_pair
+
+
+def _max_payload_bytes(local_pair_count, bytes_per_pair, device):
+    max_pair_count, _ = _distributed_int_stats(local_pair_count, device)
+    return max_pair_count * bytes_per_pair
+
+
+def _unique_remote_send_pair_count(metadata, ep_rank):
+    """Count unique source-side remote (local_home, destination rank) routes."""
+
+    local_home_routes = metadata.local_to_global_routing_map
+    count = 0
+    for local_home_idx in range(local_home_routes.shape[0]):
+        for dest_rank in range(local_home_routes.shape[1]):
+            if dest_rank == ep_rank:
+                continue
+            if local_home_routes[local_home_idx, dest_rank].any().item():
+                count += 1
+    return count
+
+
+def _symm_backward_remote_pair_count(metadata, ep_rank):
+    return sum(
+        1
+        for dest_rank, _, _, _ in metadata.backward_grad_sources
+        if dest_rank != ep_rank
+    )
+
+
+def _remote_recv_pair_count(metadata, ep_rank):
+    return sum(count for rank, count in enumerate(metadata.output_splits) if rank != ep_rank)
+
+
+def _hybridep_padded_weight_payload_bytes(dispatcher, reference_weight):
+    chunk_size = dispatcher._weight_chunk_size(reference_weight)
+    chunks_per_weight = math.ceil(reference_weight.numel() / chunk_size)
+    return chunks_per_weight * chunk_size * reference_weight.element_size()
+
+
+def _expert_dispatch_payload_stats(metadata, ep_rank, weight_shape, dtype, device):
+    weight_bytes = _weight_payload_bytes(weight_shape, dtype, device)
     local_remote_send_pairs = sum(
         count for rank, count in enumerate(metadata.input_splits) if rank != ep_rank
     )
@@ -226,17 +365,33 @@ def _expert_dispatch_payload_stats(metadata, ep_rank, weight_shape, dtype, devic
         count for rank, count in enumerate(metadata.output_splits) if rank != ep_rank
     )
 
-    total_remote_pairs = torch.tensor(local_remote_send_pairs, dtype=torch.int64, device=device)
-    busiest_remote_pairs = torch.tensor(
-        max(local_remote_send_pairs, local_remote_recv_pairs), dtype=torch.int64, device=device
+    total_remote_send_pairs = torch.tensor(local_remote_send_pairs, dtype=torch.int64, device=device)
+    busiest_send_pairs = torch.tensor(local_remote_send_pairs, dtype=torch.int64, device=device)
+    busiest_recv_pairs = torch.tensor(local_remote_recv_pairs, dtype=torch.int64, device=device)
+    busiest_send_plus_recv_pairs = torch.tensor(
+        local_remote_send_pairs + local_remote_recv_pairs, dtype=torch.int64, device=device
     )
-    torch.distributed.all_reduce(total_remote_pairs, op=torch.distributed.ReduceOp.SUM)
-    torch.distributed.all_reduce(busiest_remote_pairs, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(total_remote_send_pairs, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(busiest_send_pairs, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(busiest_recv_pairs, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(
+        busiest_send_plus_recv_pairs, op=torch.distributed.ReduceOp.MAX
+    )
 
-    remote_payload_bytes = int(total_remote_pairs.item()) * weight_bytes
-    busiest_payload_bytes = int(busiest_remote_pairs.item()) * weight_bytes
+    normalized_remote_payload_bytes = int(total_remote_send_pairs.item()) * weight_bytes
+    busiest_send_payload_bytes = int(busiest_send_pairs.item()) * weight_bytes
+    busiest_recv_payload_bytes = int(busiest_recv_pairs.item()) * weight_bytes
+    busiest_send_plus_recv_payload_bytes = (
+        int(busiest_send_plus_recv_pairs.item()) * weight_bytes
+    )
     logical_payload_bytes = int(metadata.global_routing_map.sum().item()) * weight_bytes
-    return remote_payload_bytes, busiest_payload_bytes, logical_payload_bytes
+    return _RoutePayloadStats(
+        normalized_remote_payload_bytes=normalized_remote_payload_bytes,
+        busiest_send_payload_bytes=busiest_send_payload_bytes,
+        busiest_recv_payload_bytes=busiest_recv_payload_bytes,
+        busiest_send_plus_recv_payload_bytes=busiest_send_plus_recv_payload_bytes,
+        logical_payload_bytes=logical_payload_bytes,
+    )
 
 
 def _gib_per_second(num_bytes, latency_ms):
@@ -248,30 +403,60 @@ def _gib_per_second(num_bytes, latency_ms):
 def _print_benchmark_line(
     *,
     case_name,
+    phase,
     backend,
     dtype,
     weight_shape,
-    mean_ms,
-    max_ms,
+    event_mean_ms,
+    event_max_ms,
+    wall_mean_ms,
+    wall_max_ms,
     mean_peak_mb,
     max_peak_mb,
-    remote_payload_bytes,
-    busiest_payload_bytes,
-    logical_payload_bytes,
+    route_payload_stats,
+    actual_remote_payload_bytes,
+    actual_busiest_sender_payload_bytes,
+    extra_fields=None,
 ):
+    extra_text = ""
+    if extra_fields:
+        extra_text = " " + " ".join(f"{key}={value}" for key, value in extra_fields.items())
     print(
         "BENCHMARK balanced_moe_expert_weight_dispatch "
-        f"case={case_name} backend={backend} "
+        f"case={case_name} phase={phase} backend={backend} "
         f"dtype={dtype} weight_shape={tuple(weight_shape)} "
         f"warmup_iters={_BENCHMARK_WARMUP_ITERS} iters={_BENCHMARK_ITERS} "
-        f"mean_rank_ms={mean_ms:.4f} max_rank_ms={max_ms:.4f} "
+        f"event_mean_rank_ms={event_mean_ms:.4f} event_max_rank_ms={event_max_ms:.4f} "
+        f"wall_mean_rank_ms={wall_mean_ms:.4f} wall_max_rank_ms={wall_max_ms:.4f} "
         f"mean_peak_delta_mb={mean_peak_mb:.2f} max_peak_delta_mb={max_peak_mb:.2f} "
-        f"remote_payload_mib={remote_payload_bytes / (1024**2):.2f} "
-        f"remote_bw_gib_s={_gib_per_second(remote_payload_bytes, max_ms):.2f} "
-        f"busiest_rank_remote_mib={busiest_payload_bytes / (1024**2):.2f} "
-        f"busiest_rank_bw_gib_s={_gib_per_second(busiest_payload_bytes, max_ms):.2f} "
-        f"logical_payload_mib={logical_payload_bytes / (1024**2):.2f} "
-        f"logical_bw_gib_s={_gib_per_second(logical_payload_bytes, max_ms):.2f}",
+        f"normalized_remote_payload_mib="
+        f"{route_payload_stats.normalized_remote_payload_bytes / (1024**2):.2f} "
+        f"normalized_remote_payload_algo_event_gib_s="
+        f"{_gib_per_second(route_payload_stats.normalized_remote_payload_bytes, event_max_ms):.2f} "
+        f"actual_remote_payload_mib={actual_remote_payload_bytes / (1024**2):.2f} "
+        f"actual_remote_payload_algo_event_gib_s="
+        f"{_gib_per_second(actual_remote_payload_bytes, event_max_ms):.2f} "
+        f"actual_busiest_sender_payload_mib="
+        f"{actual_busiest_sender_payload_bytes / (1024**2):.2f} "
+        f"actual_bus_bw_event_gib_s="
+        f"{_gib_per_second(actual_busiest_sender_payload_bytes, event_max_ms):.2f} "
+        f"normalized_busiest_rank_send_mib="
+        f"{route_payload_stats.busiest_send_payload_bytes / (1024**2):.2f} "
+        f"normalized_busiest_rank_send_event_gib_s="
+        f"{_gib_per_second(route_payload_stats.busiest_send_payload_bytes, event_max_ms):.2f} "
+        f"normalized_busiest_rank_recv_mib="
+        f"{route_payload_stats.busiest_recv_payload_bytes / (1024**2):.2f} "
+        f"normalized_busiest_rank_recv_event_gib_s="
+        f"{_gib_per_second(route_payload_stats.busiest_recv_payload_bytes, event_max_ms):.2f} "
+        f"normalized_busiest_rank_send_plus_recv_mib="
+        f"{route_payload_stats.busiest_send_plus_recv_payload_bytes / (1024**2):.2f} "
+        f"normalized_busiest_rank_send_plus_recv_event_gib_s="
+        f"{_gib_per_second(route_payload_stats.busiest_send_plus_recv_payload_bytes, event_max_ms):.2f} "
+        f"logical_dispatch_payload_mib="
+        f"{route_payload_stats.logical_payload_bytes / (1024**2):.2f} "
+        f"logical_dispatch_payload_algo_event_gib_s="
+        f"{_gib_per_second(route_payload_stats.logical_payload_bytes, event_max_ms):.2f}"
+        f"{extra_text}",
         flush=True,
     )
 
@@ -357,6 +542,215 @@ def test_expert_weight_dispatch_grad_foldback(dtype):
                 torch.testing.assert_close(weight.grad, expected_grad, rtol=1e-5, atol=1e-6)
             else:
                 torch.testing.assert_close(weight.grad, expected_grad, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("backend", ["all_to_all", "symmetric_memory"])
+def test_bf16_expert_weight_dispatch_combines_weight_grads_in_fp32(backend):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        if backend == "symmetric_memory":
+            dispatcher_cls = _require_symmetric_memory_expert_dispatcher()
+        else:
+            dispatcher_cls = _require_expert_dispatcher()
+
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        dtype = torch.bfloat16
+        weight_shape = torch.Size([5, 6])
+        local_home_weights = [
+            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+            for local_idx in range(2)
+        ]
+        expert_map = _single_home_all_spares_offloading_map(device)
+
+        dispatcher = dispatcher_cls(
+            config=_make_config(dtype),
+            ep_group=pg_collection.ep,
+            num_home_experts=8,
+            num_spare_experts=8,
+        )
+        metadata = dispatcher.preprocess(expert_map)
+        dispatched = dispatcher.dispatch(metadata, *local_home_weights)
+        grad_outputs = []
+        for local_spare_idx, dispatched_weight in enumerate(dispatched):
+            spare_global = ep_rank * 2 + local_spare_idx
+            grad_outputs.append(
+                _fp32_combine_probe_spare_grad(spare_global, weight_shape, dtype, device)
+                if expert_map[:, spare_global].any()
+                else torch.zeros_like(dispatched_weight)
+            )
+
+        torch.autograd.backward(dispatched, grad_outputs)
+
+        expected_fp32, expected_bf16_sequential = _expected_home_grads_from_spare_grads(
+            expert_map, weight_shape, device
+        )
+        expected_local_fp32 = expected_fp32[ep_rank * 2 : (ep_rank + 1) * 2]
+        expected_local_bf16_sequential = expected_bf16_sequential[
+            ep_rank * 2 : (ep_rank + 1) * 2
+        ]
+
+        for weight, expected_grad in zip(local_home_weights, expected_local_fp32):
+            assert weight.grad is not None
+            torch.testing.assert_close(
+                weight.grad, expected_grad.to(dtype=weight.grad.dtype), rtol=0, atol=0
+            )
+
+        if ep_rank == 0:
+            assert not torch.equal(
+                expected_local_bf16_sequential[0], expected_local_fp32[0].to(torch.bfloat16)
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("backend", ["all_to_all", "symmetric_memory"])
+def test_bf16_expert_weight_dispatch_grad_combine_dtype_is_configurable(backend):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        if backend == "symmetric_memory":
+            dispatcher_cls = _require_symmetric_memory_expert_dispatcher()
+        else:
+            dispatcher_cls = _require_expert_dispatcher()
+
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        dtype = torch.bfloat16
+        weight_shape = torch.Size([5, 6])
+        local_home_weights = [
+            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+            for local_idx in range(2)
+        ]
+        expert_map = _single_home_all_spares_offloading_map(device)
+
+        dispatcher = dispatcher_cls(
+            config=_make_config(dtype, grad_combine_dtype="bf16"),
+            ep_group=pg_collection.ep,
+            num_home_experts=8,
+            num_spare_experts=8,
+        )
+        metadata = dispatcher.preprocess(expert_map)
+        dispatched = dispatcher.dispatch(metadata, *local_home_weights)
+        grad_outputs = []
+        for local_spare_idx, dispatched_weight in enumerate(dispatched):
+            spare_global = ep_rank * 2 + local_spare_idx
+            grad_outputs.append(
+                _fp32_combine_probe_spare_grad(spare_global, weight_shape, dtype, device)
+                if expert_map[:, spare_global].any()
+                else torch.zeros_like(dispatched_weight)
+            )
+
+        torch.autograd.backward(dispatched, grad_outputs)
+
+        expected_fp32, expected_bf16_sequential = _expected_home_grads_from_spare_grads(
+            expert_map, weight_shape, device
+        )
+        expected_local_fp32 = expected_fp32[ep_rank * 2 : (ep_rank + 1) * 2]
+        expected_local_bf16_sequential = expected_bf16_sequential[
+            ep_rank * 2 : (ep_rank + 1) * 2
+        ]
+
+        for weight, expected_grad in zip(local_home_weights, expected_local_bf16_sequential):
+            assert weight.grad is not None
+            torch.testing.assert_close(weight.grad, expected_grad, rtol=0, atol=0)
+
+        if ep_rank == 0:
+            assert not torch.equal(
+                expected_local_bf16_sequential[0], expected_local_fp32[0].to(dtype)
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("backend", ["all_to_all", "symmetric_memory"])
+def test_bf16_runtime_expert_weight_grad_edge_is_fp32(backend):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        if backend == "symmetric_memory":
+            dispatcher_cls = _require_symmetric_memory_expert_dispatcher()
+        else:
+            dispatcher_cls = _require_expert_dispatcher()
+
+        balanced_module = importlib.import_module(
+            "megatron.core.transformer.moe.balanced_moe_layer"
+        )
+        cast_runtime_weights = balanced_module._cast_runtime_expert_weights_for_forward
+
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        forward_dtype = torch.bfloat16
+        weight_shape = torch.Size([5, 6])
+        local_home_weights = [
+            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, forward_dtype, device)
+            for local_idx in range(2)
+        ]
+        expert_map = _single_home_all_spares_offloading_map(device)
+
+        dispatcher = dispatcher_cls(
+            config=_make_config(forward_dtype),
+            ep_group=pg_collection.ep,
+            num_home_experts=8,
+            num_spare_experts=8,
+        )
+        metadata = dispatcher.preprocess(expert_map)
+        dispatched = dispatcher.dispatch(
+            metadata, *local_home_weights, runtime_weight_dtype=torch.float32
+        )
+
+        observed_grad_dtypes = []
+        hook_handles = []
+        for local_spare_idx, dispatched_weight in enumerate(dispatched):
+            spare_global = ep_rank * 2 + local_spare_idx
+            if not expert_map[:, spare_global].any():
+                continue
+            assert dispatched_weight.dtype is torch.float32
+
+            def record_grad_dtype(grad):
+                observed_grad_dtypes.append(grad.dtype)
+                return grad
+
+            hook_handles.append(dispatched_weight.register_hook(record_grad_dtype))
+
+        runtime_weights = cast_runtime_weights(dispatched, forward_dtype)
+        grad_outputs = []
+        for local_spare_idx, runtime_weight in enumerate(runtime_weights):
+            assert runtime_weight.dtype is forward_dtype
+            spare_global = ep_rank * 2 + local_spare_idx
+            grad_outputs.append(
+                _fp32_combine_probe_spare_grad(
+                    spare_global, weight_shape, forward_dtype, device
+                )
+                if expert_map[:, spare_global].any()
+                else torch.zeros_like(runtime_weight)
+            )
+
+        torch.autograd.backward(runtime_weights, grad_outputs)
+        for handle in hook_handles:
+            handle.remove()
+
+        assert observed_grad_dtypes
+        assert all(dtype is torch.float32 for dtype in observed_grad_dtypes)
+
+        expected_fp32, _ = _expected_home_grads_from_spare_grads(
+            expert_map, weight_shape, device
+        )
+        expected_local_fp32 = expected_fp32[ep_rank * 2 : (ep_rank + 1) * 2]
+        for weight, expected_grad in zip(local_home_weights, expected_local_fp32):
+            assert weight.grad is not None
+            torch.testing.assert_close(
+                weight.grad, expected_grad.to(dtype=weight.grad.dtype), rtol=0, atol=0
+            )
     finally:
         Utils.destroy_model_parallel()
 
@@ -521,6 +915,170 @@ def test_symmetric_memory_expert_weight_dispatch_grad_matches_native(dtype):
                 )
             else:
                 torch.testing.assert_close(symm_weight.grad, native_weight.grad, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_symmetric_memory_expert_weight_dispatch_active_staging_and_remote_read_dedup():
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        symm_dispatcher_cls = _require_symmetric_memory_expert_dispatcher()
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        dtype = torch.float32
+        weight_shape = torch.Size([5, 6])
+        local_home_weights = [
+            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+            for local_idx in range(2)
+        ]
+        all_home_weights = _gather_home_weights(local_home_weights, pg_collection.ep)
+        expert_map = _expert_offloading_map(device)
+
+        dispatcher = symm_dispatcher_cls(
+            config=_make_config(dtype),
+            ep_group=pg_collection.ep,
+            num_home_experts=8,
+            num_spare_experts=8,
+        )
+        metadata = dispatcher.preprocess(expert_map)
+        dispatched = dispatcher.dispatch(metadata, *local_home_weights)
+
+        expected = _expected_local_spare_weights(expert_map, all_home_weights, ep_rank, 2)
+        for dispatched_weight, expected_weight in zip(dispatched, expected):
+            _assert_inactive_or_expected(
+                dispatched_weight, expected_weight, weight_shape, dtype=dtype
+            )
+
+        expected_duplicate_reads_avoided = sum(
+            1
+            for local_spare_idx, alias in enumerate(metadata.remote_spare_aliases)
+            if alias is not None and alias != local_spare_idx
+        )
+        assert dispatcher._debug_staged_home_experts == len(metadata.active_local_home_indices)
+        assert dispatcher._debug_unique_remote_sources == len(metadata.unique_remote_source_indices)
+        assert dispatcher._debug_duplicate_remote_reads_avoided == expected_duplicate_reads_avoided
+        assert dispatcher._debug_low_level_get_calls == len(metadata.unique_remote_source_indices)
+
+        _, total_staged = _distributed_int_stats(
+            dispatcher._debug_staged_home_experts, device, group=pg_collection.ep
+        )
+        _, total_unique_remote_sources = _distributed_int_stats(
+            dispatcher._debug_unique_remote_sources, device, group=pg_collection.ep
+        )
+        _, total_duplicate_reads_avoided = _distributed_int_stats(
+            dispatcher._debug_duplicate_remote_reads_avoided, device, group=pg_collection.ep
+        )
+        _, total_get_calls = _distributed_int_stats(
+            dispatcher._debug_low_level_get_calls, device, group=pg_collection.ep
+        )
+        assert total_staged == 3
+        assert total_unique_remote_sources == 3
+        assert total_duplicate_reads_avoided == 1
+        assert total_get_calls == 3
+
+        loss = _run_dispatch_loss(dispatched, expert_map, ep_rank, 2, dtype, device)
+        loss.backward()
+
+        expected_global_grads = _expected_home_grads(expert_map, weight_shape, dtype, device)
+        expected_local_grads = expected_global_grads[ep_rank * 2 : (ep_rank + 1) * 2]
+        for weight, expected_grad in zip(local_home_weights, expected_local_grads):
+            assert weight.grad is not None
+            torch.testing.assert_close(weight.grad, expected_grad, rtol=1e-5, atol=1e-6)
+        assert dispatcher._debug_backward_schedule_entries == len(metadata.backward_grad_sources)
+        _, total_backward_schedule_entries = _distributed_int_stats(
+            dispatcher._debug_backward_schedule_entries, device, group=pg_collection.ep
+        )
+        assert total_backward_schedule_entries == 5
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_symmetric_memory_expert_weight_dispatch_rejects_malformed_backward_schedule():
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        symm_dispatcher_cls = _require_symmetric_memory_expert_dispatcher()
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        dtype = torch.float32
+        weight_shape = torch.Size([5, 6])
+        local_home_weights = [
+            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+            for local_idx in range(2)
+        ]
+        expert_map = _expert_offloading_map(device)
+
+        dispatcher = symm_dispatcher_cls(
+            config=_make_config(dtype),
+            ep_group=pg_collection.ep,
+            num_home_experts=8,
+            num_spare_experts=8,
+        )
+        metadata = dispatcher.preprocess(expert_map)
+        dispatched = dispatcher.dispatch(metadata, *local_home_weights)
+        metadata.backward_grad_sources = [(0, dispatcher.num_local_spare_experts, 0, 0)]
+        loss = _run_dispatch_loss(dispatched, expert_map, ep_rank, 2, dtype, device)
+
+        with pytest.raises(RuntimeError, match="invalid local spare index"):
+            loss.backward()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_symmetric_memory_expert_weight_dispatch_reuses_workspace_without_stale_data():
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        symm_dispatcher_cls = _require_symmetric_memory_expert_dispatcher()
+        pg_collection = get_default_pg_collection()
+        ep_rank = pg_collection.ep.rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        dtype = torch.float32
+        weight_shape = torch.Size([5, 6])
+        expert_map_a = _expert_offloading_map(device)
+        expert_map_b = _alternate_expert_offloading_map(device)
+
+        dispatcher = symm_dispatcher_cls(
+            config=_make_config(dtype),
+            ep_group=pg_collection.ep,
+            num_home_experts=8,
+            num_spare_experts=8,
+        )
+
+        def make_shifted_home_weights(offset):
+            return [
+                (
+                    _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+                    + offset
+                )
+                .detach()
+                .requires_grad_(True)
+                for local_idx in range(2)
+            ]
+
+        for expert_map, offset in (
+            (expert_map_a, 0.0),
+            (expert_map_b, 17.0),
+            (expert_map_a, 29.0),
+        ):
+            local_home_weights = make_shifted_home_weights(offset)
+            all_home_weights = _gather_home_weights(local_home_weights, pg_collection.ep)
+            metadata = dispatcher.preprocess(expert_map)
+            dispatched = dispatcher.dispatch(metadata, *local_home_weights)
+            expected = _expected_local_spare_weights(expert_map, all_home_weights, ep_rank, 2)
+            for dispatched_weight, expected_weight in zip(dispatched, expected):
+                _assert_inactive_or_expected(
+                    dispatched_weight, expected_weight, weight_shape, dtype=dtype
+                )
+
+        assert dispatcher._debug_home_weight_barriers == 1
+        assert dispatcher._debug_workspace_sync_mode == "double_buffered_stage_barrier"
     finally:
         Utils.destroy_model_parallel()
 
@@ -902,48 +1460,138 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
         global_rank = torch.distributed.get_rank()
         device = torch.device("cuda", torch.cuda.current_device())
         dtype = torch.bfloat16
-        local_home_weights = [
-            _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
-            for local_idx in range(2)
-        ]
         expert_map = _expert_offloading_map(device)
         config = _make_config(dtype)
+        weight_bytes = _weight_payload_bytes(weight_shape, dtype, device)
+
+        def make_home_weights():
+            return [
+                _make_home_weight(ep_rank * 2 + local_idx, weight_shape, dtype, device)
+                for local_idx in range(2)
+            ]
+
+        local_home_weights = make_home_weights()
+
+        def make_dispatch_loss(dispatcher, metadata):
+            weights = make_home_weights()
+            dispatched = dispatcher.dispatch(metadata, *weights)
+            loss = _run_dispatch_loss(dispatched, expert_map, ep_rank, 2, dtype, device)
+            return loss, weights
+
+        def dispatch_gradients(dispatcher, metadata):
+            loss, weights = make_dispatch_loss(dispatcher, metadata)
+            loss.backward()
+            return [weight.grad.detach().clone() for weight in weights]
+
+        def assert_gradients_match(candidate_dispatcher, candidate_metadata):
+            native_grads = dispatch_gradients(native_dispatcher, native_metadata)
+            candidate_grads = dispatch_gradients(candidate_dispatcher, candidate_metadata)
+            for native_grad, candidate_grad in zip(native_grads, candidate_grads):
+                torch.testing.assert_close(candidate_grad, native_grad, rtol=2e-2, atol=2e-2)
+
+        def distributed_timing_stats(event_ms, wall_ms, peak_delta_mb):
+            event_max_ms, event_mean_ms = _distributed_float_stats(event_ms, device)
+            wall_max_ms, wall_mean_ms = _distributed_float_stats(wall_ms, device)
+            max_peak_mb, mean_peak_mb = _distributed_float_stats(peak_delta_mb, device)
+            return (
+                event_mean_ms,
+                event_max_ms,
+                wall_mean_ms,
+                wall_max_ms,
+                mean_peak_mb,
+                max_peak_mb,
+            )
 
         native_dispatcher = native_dispatcher_cls(
             config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
         )
         native_metadata = native_dispatcher.preprocess(expert_map)
-        remote_payload_bytes, busiest_payload_bytes, logical_payload_bytes = (
-            _expert_dispatch_payload_stats(native_metadata, ep_rank, weight_shape, dtype, device)
+        route_payload_stats = _expert_dispatch_payload_stats(
+            native_metadata, ep_rank, weight_shape, dtype, device
         )
 
         def run_native_dispatch():
             with torch.no_grad():
                 return native_dispatcher.dispatch(native_metadata, *local_home_weights)
 
-        native_latency_ms, native_peak_delta_mb, native_dispatched = (
+        (
+            native_event_latency_ms,
+            native_wall_latency_ms,
+            native_peak_delta_mb,
+            native_dispatched,
+        ) = (
             _cuda_event_latency_and_peak_delta_mb(run_native_dispatch, device)
         )
-        assert native_latency_ms > 0.0
+        assert native_event_latency_ms > 0.0
+        assert native_wall_latency_ms > 0.0
         assert len(native_dispatched) == 2
-        native_max_ms, native_mean_ms = _distributed_float_stats(native_latency_ms, device)
-        native_max_peak_mb, native_mean_peak_mb = _distributed_float_stats(
-            native_peak_delta_mb, device
+        (
+            native_event_mean_ms,
+            native_event_max_ms,
+            native_wall_mean_ms,
+            native_wall_max_ms,
+            native_mean_peak_mb,
+            native_max_peak_mb,
+        ) = distributed_timing_stats(
+            native_event_latency_ms, native_wall_latency_ms, native_peak_delta_mb
         )
 
         if global_rank == 0:
             _print_benchmark_line(
                 case_name=case_name,
+                phase="forward",
                 backend="native_all_to_all",
                 dtype=dtype,
                 weight_shape=weight_shape,
-                mean_ms=native_mean_ms,
-                max_ms=native_max_ms,
+                event_mean_ms=native_event_mean_ms,
+                event_max_ms=native_event_max_ms,
+                wall_mean_ms=native_wall_mean_ms,
+                wall_max_ms=native_wall_max_ms,
                 mean_peak_mb=native_mean_peak_mb,
                 max_peak_mb=native_max_peak_mb,
-                remote_payload_bytes=remote_payload_bytes,
-                busiest_payload_bytes=busiest_payload_bytes,
-                logical_payload_bytes=logical_payload_bytes,
+                route_payload_stats=route_payload_stats,
+                actual_remote_payload_bytes=route_payload_stats.normalized_remote_payload_bytes,
+                actual_busiest_sender_payload_bytes=route_payload_stats.busiest_send_payload_bytes,
+            )
+
+        def make_native_loss():
+            return make_dispatch_loss(native_dispatcher, native_metadata)
+
+        (
+            native_backward_event_ms,
+            native_backward_wall_ms,
+            native_backward_peak_delta_mb,
+            _,
+        ) = _cuda_event_backward_latency_and_peak_delta_mb(make_native_loss, device)
+        assert native_backward_event_ms > 0.0
+        assert native_backward_wall_ms > 0.0
+        (
+            native_backward_event_mean_ms,
+            native_backward_event_max_ms,
+            native_backward_wall_mean_ms,
+            native_backward_wall_max_ms,
+            native_backward_mean_peak_mb,
+            native_backward_max_peak_mb,
+        ) = distributed_timing_stats(
+            native_backward_event_ms, native_backward_wall_ms, native_backward_peak_delta_mb
+        )
+
+        if global_rank == 0:
+            _print_benchmark_line(
+                case_name=case_name,
+                phase="backward",
+                backend="native_all_to_all",
+                dtype=dtype,
+                weight_shape=weight_shape,
+                event_mean_ms=native_backward_event_mean_ms,
+                event_max_ms=native_backward_event_max_ms,
+                wall_mean_ms=native_backward_wall_mean_ms,
+                wall_max_ms=native_backward_wall_max_ms,
+                mean_peak_mb=native_backward_mean_peak_mb,
+                max_peak_mb=native_backward_max_peak_mb,
+                route_payload_stats=route_payload_stats,
+                actual_remote_payload_bytes=route_payload_stats.normalized_remote_payload_bytes,
+                actual_busiest_sender_payload_bytes=route_payload_stats.busiest_recv_payload_bytes,
             )
 
         symm_error = None
@@ -959,48 +1607,154 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
             )
             symm_metadata = symm_dispatcher.preprocess(expert_map)
             symm_dispatcher._get_workspace(local_home_weights[0])
+            symm_forward_actual_payload_bytes = _global_payload_bytes(
+                len(symm_metadata.unique_remote_source_indices), weight_bytes, device
+            )
+            symm_forward_busiest_sender_payload_bytes = _max_payload_bytes(
+                _unique_remote_send_pair_count(symm_metadata, ep_rank), weight_bytes, device
+            )
+            symm_backward_actual_payload_bytes = _global_payload_bytes(
+                _symm_backward_remote_pair_count(symm_metadata, ep_rank), weight_bytes, device
+            )
+            symm_backward_busiest_sender_payload_bytes = _max_payload_bytes(
+                _remote_recv_pair_count(symm_metadata, ep_rank), weight_bytes, device
+            )
 
             def run_symm_dispatch():
                 with torch.no_grad():
                     return symm_dispatcher.dispatch(symm_metadata, *local_home_weights)
 
-            symm_latency_ms, symm_peak_delta_mb, symm_dispatched = (
+            (
+                symm_event_latency_ms,
+                symm_wall_latency_ms,
+                symm_peak_delta_mb,
+                symm_dispatched,
+            ) = (
                 _cuda_event_latency_and_peak_delta_mb(run_symm_dispatch, device)
             )
-            assert symm_latency_ms > 0.0
-            get_calls = torch.tensor(
-                symm_dispatcher._debug_low_level_get_calls, dtype=torch.int64, device=device
+            assert symm_event_latency_ms > 0.0
+            assert symm_wall_latency_ms > 0.0
+            _, total_get_calls = _distributed_int_stats(
+                symm_dispatcher._debug_low_level_get_calls, device
             )
-            torch.distributed.all_reduce(get_calls, op=torch.distributed.ReduceOp.SUM)
-            assert get_calls.item() > 0
-            symm_max_ms, symm_mean_ms = _distributed_float_stats(symm_latency_ms, device)
-            symm_max_peak_mb, symm_mean_peak_mb = _distributed_float_stats(
-                symm_peak_delta_mb, device
+            _, total_staged_homes = _distributed_int_stats(
+                symm_dispatcher._debug_staged_home_experts, device
+            )
+            _, total_unique_remote_sources = _distributed_int_stats(
+                symm_dispatcher._debug_unique_remote_sources, device
+            )
+            _, total_duplicate_reads_avoided = _distributed_int_stats(
+                symm_dispatcher._debug_duplicate_remote_reads_avoided, device
+            )
+            max_home_weight_barriers, _ = _distributed_int_stats(
+                symm_dispatcher._debug_home_weight_barriers, device
+            )
+            assert total_get_calls > 0
+            symm_extra_fields = {
+                "symm_low_level_get_calls": total_get_calls,
+                "symm_staged_home_experts": total_staged_homes,
+                "symm_unique_remote_sources": total_unique_remote_sources,
+                "symm_duplicate_remote_reads_avoided": total_duplicate_reads_avoided,
+                "symm_home_weight_barriers_per_rank": max_home_weight_barriers,
+                "symm_workspace_sync_mode": symm_dispatcher._debug_workspace_sync_mode,
+            }
+            assert {
+                "symm_low_level_get_calls",
+                "symm_staged_home_experts",
+                "symm_unique_remote_sources",
+                "symm_duplicate_remote_reads_avoided",
+                "symm_home_weight_barriers_per_rank",
+                "symm_workspace_sync_mode",
+            } <= symm_extra_fields.keys()
+            (
+                symm_event_mean_ms,
+                symm_event_max_ms,
+                symm_wall_mean_ms,
+                symm_wall_max_ms,
+                symm_mean_peak_mb,
+                symm_max_peak_mb,
+            ) = distributed_timing_stats(
+                symm_event_latency_ms, symm_wall_latency_ms, symm_peak_delta_mb
+            )
+
+            for native_weight, symm_weight in zip(native_dispatched, symm_dispatched):
+                torch.testing.assert_close(symm_weight, native_weight, rtol=0, atol=0)
+            assert_gradients_match(symm_dispatcher, symm_metadata)
+
+            if global_rank == 0:
+                _print_benchmark_line(
+                    case_name=case_name,
+                    phase="forward",
+                    backend="symmetric_memory",
+                    dtype=dtype,
+                    weight_shape=weight_shape,
+                    event_mean_ms=symm_event_mean_ms,
+                    event_max_ms=symm_event_max_ms,
+                    wall_mean_ms=symm_wall_mean_ms,
+                    wall_max_ms=symm_wall_max_ms,
+                    mean_peak_mb=symm_mean_peak_mb,
+                    max_peak_mb=symm_max_peak_mb,
+                    route_payload_stats=route_payload_stats,
+                    actual_remote_payload_bytes=symm_forward_actual_payload_bytes,
+                    actual_busiest_sender_payload_bytes=symm_forward_busiest_sender_payload_bytes,
+                    extra_fields=symm_extra_fields,
+                )
+
+            def make_symm_loss():
+                return make_dispatch_loss(symm_dispatcher, symm_metadata)
+
+            (
+                symm_backward_event_ms,
+                symm_backward_wall_ms,
+                symm_backward_peak_delta_mb,
+                _,
+            ) = _cuda_event_backward_latency_and_peak_delta_mb(make_symm_loss, device)
+            assert symm_backward_event_ms > 0.0
+            assert symm_backward_wall_ms > 0.0
+            _, total_backward_schedule_entries = _distributed_int_stats(
+                symm_dispatcher._debug_backward_schedule_entries, device
+            )
+            symm_backward_extra_fields = {
+                "symm_backward_schedule_entries": total_backward_schedule_entries,
+                "symm_workspace_sync_mode": symm_dispatcher._debug_workspace_sync_mode,
+            }
+            (
+                symm_backward_event_mean_ms,
+                symm_backward_event_max_ms,
+                symm_backward_wall_mean_ms,
+                symm_backward_wall_max_ms,
+                symm_backward_mean_peak_mb,
+                symm_backward_max_peak_mb,
+            ) = distributed_timing_stats(
+                symm_backward_event_ms, symm_backward_wall_ms, symm_backward_peak_delta_mb
             )
 
             if global_rank == 0:
                 _print_benchmark_line(
                     case_name=case_name,
+                    phase="backward",
                     backend="symmetric_memory",
                     dtype=dtype,
                     weight_shape=weight_shape,
-                    mean_ms=symm_mean_ms,
-                    max_ms=symm_max_ms,
-                    mean_peak_mb=symm_mean_peak_mb,
-                    max_peak_mb=symm_max_peak_mb,
-                    remote_payload_bytes=remote_payload_bytes,
-                    busiest_payload_bytes=busiest_payload_bytes,
-                    logical_payload_bytes=logical_payload_bytes,
+                    event_mean_ms=symm_backward_event_mean_ms,
+                    event_max_ms=symm_backward_event_max_ms,
+                    wall_mean_ms=symm_backward_wall_mean_ms,
+                    wall_max_ms=symm_backward_wall_max_ms,
+                    mean_peak_mb=symm_backward_mean_peak_mb,
+                    max_peak_mb=symm_backward_max_peak_mb,
+                    route_payload_stats=route_payload_stats,
+                    actual_remote_payload_bytes=symm_backward_actual_payload_bytes,
+                    actual_busiest_sender_payload_bytes=symm_backward_busiest_sender_payload_bytes,
+                    extra_fields=symm_backward_extra_fields,
                 )
-
-            for native_weight, symm_weight in zip(native_dispatched, symm_dispatched):
-                torch.testing.assert_close(symm_weight, native_weight, rtol=0, atol=0)
         elif global_rank == 0:
-            print(
-                "BENCHMARK balanced_moe_expert_weight_dispatch "
-                f"case={case_name} backend=symmetric_memory skipped reason={symm_error!r}",
-                flush=True,
-            )
+            for phase in ("forward", "backward"):
+                print(
+                    "BENCHMARK balanced_moe_expert_weight_dispatch "
+                    f"case={case_name} phase={phase} backend=symmetric_memory "
+                    f"skipped reason={symm_error!r}",
+                    flush=True,
+                )
 
         hybridep_error = None
         if hybridep_dispatcher_cls is None:
@@ -1013,44 +1767,129 @@ def test_expert_weight_dispatch_latency_benchmark(case_name, weight_shape):
                 config=config, ep_group=pg_collection.ep, num_home_experts=8, num_spare_experts=8
             )
             hybridep_metadata = hybridep_dispatcher.preprocess(expert_map)
+            hybridep_pair_payload_bytes = _hybridep_padded_weight_payload_bytes(
+                hybridep_dispatcher, local_home_weights[0]
+            )
+            hybridep_actual_payload_bytes = _global_payload_bytes(
+                _unique_remote_send_pair_count(hybridep_metadata, ep_rank),
+                hybridep_pair_payload_bytes,
+                device,
+            )
+            hybridep_forward_busiest_sender_payload_bytes = _max_payload_bytes(
+                _unique_remote_send_pair_count(hybridep_metadata, ep_rank),
+                hybridep_pair_payload_bytes,
+                device,
+            )
+            hybridep_backward_busiest_sender_payload_bytes = _max_payload_bytes(
+                len(hybridep_metadata.unique_remote_source_indices),
+                hybridep_pair_payload_bytes,
+                device,
+            )
 
             def run_hybridep_dispatch():
                 with torch.no_grad():
                     return hybridep_dispatcher.dispatch(hybridep_metadata, *local_home_weights)
 
-            hybridep_latency_ms, hybridep_peak_delta_mb, hybridep_dispatched = (
+            (
+                hybridep_event_latency_ms,
+                hybridep_wall_latency_ms,
+                hybridep_peak_delta_mb,
+                hybridep_dispatched,
+            ) = (
                 _cuda_event_latency_and_peak_delta_mb(run_hybridep_dispatch, device)
             )
-            assert hybridep_latency_ms > 0.0
-            hybridep_max_ms, hybridep_mean_ms = _distributed_float_stats(
-                hybridep_latency_ms, device
+            assert hybridep_event_latency_ms > 0.0
+            assert hybridep_wall_latency_ms > 0.0
+            (
+                hybridep_event_mean_ms,
+                hybridep_event_max_ms,
+                hybridep_wall_mean_ms,
+                hybridep_wall_max_ms,
+                hybridep_mean_peak_mb,
+                hybridep_max_peak_mb,
+            ) = distributed_timing_stats(
+                hybridep_event_latency_ms, hybridep_wall_latency_ms, hybridep_peak_delta_mb
             )
-            hybridep_max_peak_mb, hybridep_mean_peak_mb = _distributed_float_stats(
-                hybridep_peak_delta_mb, device
+
+            for native_weight, hybridep_weight in zip(native_dispatched, hybridep_dispatched):
+                torch.testing.assert_close(hybridep_weight, native_weight, rtol=0, atol=0)
+            assert_gradients_match(hybridep_dispatcher, hybridep_metadata)
+
+            hybridep_extra_fields = {
+                "hybridep_unique_remote_pairs": int(
+                    hybridep_actual_payload_bytes / hybridep_pair_payload_bytes
+                ),
+                "hybridep_padded_pair_payload_mib": f"{hybridep_pair_payload_bytes / (1024**2):.2f}",
+            }
+
+            if global_rank == 0:
+                _print_benchmark_line(
+                    case_name=case_name,
+                    phase="forward",
+                    backend="hybridep",
+                    dtype=dtype,
+                    weight_shape=weight_shape,
+                    event_mean_ms=hybridep_event_mean_ms,
+                    event_max_ms=hybridep_event_max_ms,
+                    wall_mean_ms=hybridep_wall_mean_ms,
+                    wall_max_ms=hybridep_wall_max_ms,
+                    mean_peak_mb=hybridep_mean_peak_mb,
+                    max_peak_mb=hybridep_max_peak_mb,
+                    route_payload_stats=route_payload_stats,
+                    actual_remote_payload_bytes=hybridep_actual_payload_bytes,
+                    actual_busiest_sender_payload_bytes=hybridep_forward_busiest_sender_payload_bytes,
+                    extra_fields=hybridep_extra_fields,
+                )
+
+            def make_hybridep_loss():
+                return make_dispatch_loss(hybridep_dispatcher, hybridep_metadata)
+
+            (
+                hybridep_backward_event_ms,
+                hybridep_backward_wall_ms,
+                hybridep_backward_peak_delta_mb,
+                _,
+            ) = _cuda_event_backward_latency_and_peak_delta_mb(make_hybridep_loss, device)
+            assert hybridep_backward_event_ms > 0.0
+            assert hybridep_backward_wall_ms > 0.0
+            (
+                hybridep_backward_event_mean_ms,
+                hybridep_backward_event_max_ms,
+                hybridep_backward_wall_mean_ms,
+                hybridep_backward_wall_max_ms,
+                hybridep_backward_mean_peak_mb,
+                hybridep_backward_max_peak_mb,
+            ) = distributed_timing_stats(
+                hybridep_backward_event_ms,
+                hybridep_backward_wall_ms,
+                hybridep_backward_peak_delta_mb,
             )
 
             if global_rank == 0:
                 _print_benchmark_line(
                     case_name=case_name,
+                    phase="backward",
                     backend="hybridep",
                     dtype=dtype,
                     weight_shape=weight_shape,
-                    mean_ms=hybridep_mean_ms,
-                    max_ms=hybridep_max_ms,
-                    mean_peak_mb=hybridep_mean_peak_mb,
-                    max_peak_mb=hybridep_max_peak_mb,
-                    remote_payload_bytes=remote_payload_bytes,
-                    busiest_payload_bytes=busiest_payload_bytes,
-                    logical_payload_bytes=logical_payload_bytes,
+                    event_mean_ms=hybridep_backward_event_mean_ms,
+                    event_max_ms=hybridep_backward_event_max_ms,
+                    wall_mean_ms=hybridep_backward_wall_mean_ms,
+                    wall_max_ms=hybridep_backward_wall_max_ms,
+                    mean_peak_mb=hybridep_backward_mean_peak_mb,
+                    max_peak_mb=hybridep_backward_max_peak_mb,
+                    route_payload_stats=route_payload_stats,
+                    actual_remote_payload_bytes=hybridep_actual_payload_bytes,
+                    actual_busiest_sender_payload_bytes=hybridep_backward_busiest_sender_payload_bytes,
+                    extra_fields=hybridep_extra_fields,
                 )
-
-            for native_weight, hybridep_weight in zip(native_dispatched, hybridep_dispatched):
-                torch.testing.assert_close(hybridep_weight, native_weight, rtol=0, atol=0)
         elif global_rank == 0:
-            print(
-                "BENCHMARK balanced_moe_expert_weight_dispatch "
-                f"case={case_name} backend=hybridep skipped reason={hybridep_error!r}",
-                flush=True,
-            )
+            for phase in ("forward", "backward"):
+                print(
+                    "BENCHMARK balanced_moe_expert_weight_dispatch "
+                    f"case={case_name} phase={phase} backend=hybridep "
+                    f"skipped reason={hybridep_error!r}",
+                    flush=True,
+                )
     finally:
         Utils.destroy_model_parallel()

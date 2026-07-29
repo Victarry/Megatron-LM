@@ -25,6 +25,45 @@ except ImportError:
     HybridEPBuffer = None
 
 _HYBRIDEP_WEIGHT_TOKEN_ALIGNMENT = 64
+_SYMMETRIC_MEMORY_BUFFER_SLOTS = 2
+_EXPERT_WEIGHT_GRAD_COMBINE_DTYPE_POLICIES = ("fp32", "param_dtype", "bf16", "fp16")
+
+
+def _expert_weight_grad_combine_dtype(
+    weight_dtype: torch.dtype, policy: str = "fp32"
+) -> torch.dtype:
+    """Resolve the dtype used when folding spare weight gradients."""
+
+    if policy == "fp32":
+        if weight_dtype in (torch.float16, torch.bfloat16):
+            return torch.float32
+        return weight_dtype
+    if policy == "param_dtype":
+        return weight_dtype
+    if policy == "bf16":
+        return torch.bfloat16
+    if policy == "fp16":
+        return torch.float16
+    raise ValueError(
+        "moe_balance_expert_weight_grad_combine_dtype must be one of "
+        f"{_EXPERT_WEIGHT_GRAD_COMBINE_DTYPE_POLICIES}; got {policy!r}."
+    )
+
+
+def _expert_weight_grad_combine_policy(config: TransformerConfig) -> str:
+    policy = getattr(config, "moe_balance_expert_weight_grad_combine_dtype", "fp32")
+    if policy not in _EXPERT_WEIGHT_GRAD_COMBINE_DTYPE_POLICIES:
+        raise ValueError(
+            "moe_balance_expert_weight_grad_combine_dtype must be one of "
+            f"{_EXPERT_WEIGHT_GRAD_COMBINE_DTYPE_POLICIES}; got {policy!r}."
+        )
+    return policy
+
+
+def _runtime_weight_grad_edge_dtype(weight_dtype: torch.dtype, policy: str) -> torch.dtype:
+    """Dtype for non-TE runtime-weight autograd edges."""
+
+    return _expert_weight_grad_combine_dtype(weight_dtype, policy)
 
 
 @dataclass
@@ -41,6 +80,11 @@ class ExpertWeightDispatchMetadata:
     local_spare_home_indices: torch.Tensor
     send_local_home_indices: list[int]
     recv_local_spare_indices: list[int]
+    active_local_home_indices: list[int]
+    local_spare_sources: list[Optional[tuple[int, int]]]
+    remote_spare_aliases: list[Optional[int]]
+    unique_remote_source_indices: list[int]
+    backward_grad_sources: list[tuple[int, int, int, int]]
 
 
 @dataclass
@@ -51,6 +95,8 @@ class _SymmetricExpertWeightDispatchWorkspace:
     spare_grad_buffer: torch.Tensor
     home_weight_handle: Any
     spare_grad_handle: Any
+    next_home_weight_slot: int = 0
+    next_spare_grad_slot: int = 0
 
 
 class _AllToAllExpertWeightDispatch(torch.autograd.Function):
@@ -68,6 +114,8 @@ class _AllToAllExpertWeightDispatch(torch.autograd.Function):
         output_splits: list[int],
         send_local_home_indices: list[int],
         recv_local_spare_indices: list[int],
+        runtime_weight_dtype: Optional[torch.dtype],
+        grad_combine_dtype: torch.dtype,
         *local_home_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         """Send active home expert weights to local spare expert slots."""
@@ -81,6 +129,8 @@ class _AllToAllExpertWeightDispatch(torch.autograd.Function):
             raise ValueError("At least one local home weight is required.")
 
         reference_weight = local_home_weights[0]
+        if runtime_weight_dtype is None:
+            runtime_weight_dtype = reference_weight.dtype
         for weight in local_home_weights:
             if weight.shape != reference_weight.shape:
                 raise ValueError(
@@ -119,11 +169,17 @@ class _AllToAllExpertWeightDispatch(torch.autograd.Function):
         )
 
         outputs: list[torch.Tensor] = [
-            reference_weight.new_zeros(reference_weight.shape)
+            torch.zeros(
+                reference_weight.shape,
+                dtype=runtime_weight_dtype,
+                device=reference_weight.device,
+            )
             for _ in range(num_local_spare_experts)
         ]
         for recv_offset, local_spare_idx in enumerate(recv_local_spare_indices):
-            outputs[local_spare_idx] = recv_tensor[recv_offset].clone()
+            outputs[local_spare_idx] = recv_tensor[recv_offset].clone().to(
+                dtype=runtime_weight_dtype
+            )
 
         ctx.ep_group = ep_group
         ctx.ep_rank = ep_rank
@@ -131,6 +187,7 @@ class _AllToAllExpertWeightDispatch(torch.autograd.Function):
         ctx.num_local_home_experts = num_local_home_experts
         ctx.weight_shape = tuple(reference_weight.shape)
         ctx.weight_dtype = reference_weight.dtype
+        ctx.grad_combine_dtype = grad_combine_dtype
         ctx.weight_device = reference_weight.device
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
@@ -143,25 +200,26 @@ class _AllToAllExpertWeightDispatch(torch.autograd.Function):
     def backward(ctx, *grad_outputs: Optional[torch.Tensor]):
         """Fold spare expert gradients back to their owning home experts."""
 
+        grad_combine_dtype = ctx.grad_combine_dtype
         grad_send_tensors: list[torch.Tensor] = []
         for local_spare_idx in ctx.recv_local_spare_indices:
             grad_output = grad_outputs[local_spare_idx]
             if grad_output is None:
                 grad_send_tensors.append(
-                    torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device)
+                    torch.zeros(ctx.weight_shape, dtype=grad_combine_dtype, device=ctx.weight_device)
                 )
             else:
-                grad_send_tensors.append(grad_output)
+                grad_send_tensors.append(grad_output.to(dtype=grad_combine_dtype))
 
         if grad_send_tensors:
             grad_send_tensor = torch.stack(grad_send_tensors, dim=0).contiguous()
         else:
             grad_send_tensor = torch.empty(
-                (0, *ctx.weight_shape), dtype=ctx.weight_dtype, device=ctx.weight_device
+                (0, *ctx.weight_shape), dtype=grad_combine_dtype, device=ctx.weight_device
             )
         grad_recv_tensor = torch.empty(
             (sum(ctx.input_splits), *ctx.weight_shape),
-            dtype=ctx.weight_dtype,
+            dtype=grad_combine_dtype,
             device=ctx.weight_device,
         )
 
@@ -174,13 +232,13 @@ class _AllToAllExpertWeightDispatch(torch.autograd.Function):
         )
 
         local_home_grads = [
-            torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device)
+            torch.zeros(ctx.weight_shape, dtype=grad_combine_dtype, device=ctx.weight_device)
             for _ in range(ctx.num_local_home_experts)
         ]
         for local_home_idx, grad in zip(ctx.send_local_home_indices, grad_recv_tensor):
             local_home_grads[local_home_idx].add_(grad)
 
-        return (None, None, None, None, None, None, None, None, None, *local_home_grads)
+        return (None, None, None, None, None, None, None, None, None, None, None, *local_home_grads)
 
 
 class AllToAllExpertWeightDispatcher:
@@ -199,6 +257,7 @@ class AllToAllExpertWeightDispatcher:
         self.ep_rank = torch.distributed.get_rank(group=ep_group)
         self.num_home_experts = num_home_experts
         self.num_spare_experts = num_spare_experts
+        self.grad_combine_dtype_policy = _expert_weight_grad_combine_policy(config)
 
         if self.num_home_experts <= 0:
             raise ValueError("num_home_experts must be positive.")
@@ -211,6 +270,12 @@ class AllToAllExpertWeightDispatcher:
 
         self.num_local_home_experts = self.num_home_experts // self.ep_size
         self.num_local_spare_experts = self.num_spare_experts // self.ep_size
+
+    def _grad_combine_dtype(self, weight_dtype: torch.dtype) -> torch.dtype:
+        return _expert_weight_grad_combine_dtype(weight_dtype, self.grad_combine_dtype_policy)
+
+    def _runtime_weight_grad_edge_dtype(self, weight_dtype: torch.dtype) -> torch.dtype:
+        return _runtime_weight_grad_edge_dtype(weight_dtype, self.grad_combine_dtype_policy)
 
     def preprocess(self, expert_offloading_map: torch.Tensor) -> ExpertWeightDispatchMetadata:
         """Validate and reshape the global home-to-spare expert map."""
@@ -252,6 +317,11 @@ class AllToAllExpertWeightDispatcher:
 
         send_local_home_indices_by_rank: list[list[int]] = [[] for _ in range(self.ep_size)]
         recv_local_spare_indices_by_rank: list[list[int]] = [[] for _ in range(self.ep_size)]
+        active_local_home_indices: set[int] = set()
+        local_spare_sources: list[Optional[tuple[int, int]]] = [
+            None for _ in range(self.num_local_spare_experts)
+        ]
+        backward_grad_sources: list[tuple[int, int, int, int]] = []
         for spare_idx in range(self.num_spare_experts):
             home_indices = torch.where(expert_offloading_map[:, spare_idx])[0]
             if home_indices.numel() == 0:
@@ -264,8 +334,32 @@ class AllToAllExpertWeightDispatcher:
 
             if source_rank == self.ep_rank:
                 send_local_home_indices_by_rank[dest_rank].append(local_home_idx)
+                backward_grad_sources.append(
+                    (dest_rank, local_spare_idx, local_home_idx, local_spare_idx)
+                )
+                if dest_rank != self.ep_rank:
+                    active_local_home_indices.add(local_home_idx)
             if dest_rank == self.ep_rank:
                 recv_local_spare_indices_by_rank[source_rank].append(local_spare_idx)
+                local_spare_sources[local_spare_idx] = (source_rank, local_home_idx)
+
+        remote_spare_aliases: list[Optional[int]] = [
+            None for _ in range(self.num_local_spare_experts)
+        ]
+        unique_remote_source_indices: list[int] = []
+        representative_by_source: dict[tuple[int, int], int] = {}
+        for local_spare_idx, source in enumerate(local_spare_sources):
+            if source is None:
+                continue
+            source_rank, _ = source
+            if source_rank == self.ep_rank:
+                continue
+            representative_local_spare_idx = representative_by_source.setdefault(
+                source, local_spare_idx
+            )
+            remote_spare_aliases[local_spare_idx] = representative_local_spare_idx
+            if representative_local_spare_idx == local_spare_idx:
+                unique_remote_source_indices.append(local_spare_idx)
 
         return ExpertWeightDispatchMetadata(
             global_routing_map=expert_offloading_map,
@@ -286,13 +380,23 @@ class AllToAllExpertWeightDispatcher:
                 for per_rank_indices in recv_local_spare_indices_by_rank
                 for local_spare_idx in per_rank_indices
             ],
+            active_local_home_indices=sorted(active_local_home_indices),
+            local_spare_sources=local_spare_sources,
+            remote_spare_aliases=remote_spare_aliases,
+            unique_remote_source_indices=unique_remote_source_indices,
+            backward_grad_sources=backward_grad_sources,
         )
 
     def dispatch(
-        self, metadata: ExpertWeightDispatchMetadata, *expert_weights: torch.Tensor
+        self,
+        metadata: ExpertWeightDispatchMetadata,
+        *expert_weights: torch.Tensor,
+        runtime_weight_dtype: Optional[torch.dtype] = None,
     ) -> list[torch.Tensor]:
         """Return weights for this rank's local spare slots."""
 
+        if not expert_weights:
+            raise ValueError("At least one local home weight is required.")
         outputs = _AllToAllExpertWeightDispatch.apply(
             self.ep_group,
             self.ep_rank,
@@ -303,16 +407,73 @@ class AllToAllExpertWeightDispatcher:
             metadata.output_splits,
             metadata.send_local_home_indices,
             metadata.recv_local_spare_indices,
+            runtime_weight_dtype,
+            self._grad_combine_dtype(expert_weights[0].dtype),
             *expert_weights,
         )
         return list(outputs)
 
     def expert_dispatch(
-        self, metadata: ExpertWeightDispatchMetadata, *expert_weights: torch.Tensor
+        self,
+        metadata: ExpertWeightDispatchMetadata,
+        *expert_weights: torch.Tensor,
+        runtime_weight_dtype: Optional[torch.dtype] = None,
     ) -> list[torch.Tensor]:
         """Compatibility alias for the old Echo dispatcher method name."""
 
-        return self.dispatch(metadata, *expert_weights)
+        return self.dispatch(
+            metadata, *expert_weights, runtime_weight_dtype=runtime_weight_dtype
+        )
+
+    def fold_spare_gradients(
+        self,
+        metadata: ExpertWeightDispatchMetadata,
+        *local_spare_grads: torch.Tensor,
+        reference_weight_dtype: Optional[torch.dtype] = None,
+    ) -> list[torch.Tensor]:
+        """Fold local spare-slot gradients back to local home expert gradients."""
+
+        if not local_spare_grads:
+            raise ValueError("At least one local spare gradient is required.")
+        reference_grad = local_spare_grads[0]
+        grad_combine_dtype = self._grad_combine_dtype(
+            reference_weight_dtype or reference_grad.dtype
+        )
+        grad_send_tensors: list[torch.Tensor] = []
+        for local_spare_idx in metadata.recv_local_spare_indices:
+            grad_send_tensors.append(
+                local_spare_grads[local_spare_idx].to(dtype=grad_combine_dtype)
+            )
+
+        if grad_send_tensors:
+            grad_send_tensor = torch.stack(grad_send_tensors, dim=0).contiguous()
+        else:
+            grad_send_tensor = torch.empty(
+                (0, *reference_grad.shape),
+                dtype=grad_combine_dtype,
+                device=reference_grad.device,
+            )
+        grad_recv_tensor = torch.empty(
+            (sum(metadata.input_splits), *reference_grad.shape),
+            dtype=grad_combine_dtype,
+            device=reference_grad.device,
+        )
+
+        torch.distributed.all_to_all_single(
+            grad_recv_tensor,
+            grad_send_tensor,
+            output_split_sizes=metadata.input_splits,
+            input_split_sizes=metadata.output_splits,
+            group=self.ep_group,
+        )
+
+        local_home_grads = [
+            torch.zeros(reference_grad.shape, dtype=grad_combine_dtype, device=reference_grad.device)
+            for _ in range(self.num_local_home_experts)
+        ]
+        for local_home_idx, grad in zip(metadata.send_local_home_indices, grad_recv_tensor):
+            local_home_grads[local_home_idx].add_(grad)
+        return local_home_grads
 
 
 def _get_symmetric_memory_module():
@@ -353,55 +514,88 @@ class _SymmetricMemoryExpertWeightDispatch(torch.autograd.Function):
         ctx,
         dispatcher: "SymmetricMemoryExpertWeightDispatcher",
         metadata: ExpertWeightDispatchMetadata,
+        runtime_weight_dtype: Optional[torch.dtype],
+        grad_combine_dtype: torch.dtype,
         *local_home_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         """Read remote home expert weights through symmetric-memory handles."""
 
         dispatcher._validate_weights(local_home_weights)
+        dispatcher._reset_debug_counters()
         reference_weight = local_home_weights[0]
+        if runtime_weight_dtype is None:
+            runtime_weight_dtype = reference_weight.dtype
         weight_numel = reference_weight.numel()
-        workspace = dispatcher._get_workspace(reference_weight)
-        home_weight_view = workspace.home_weight_buffer.view(
-            dispatcher.num_local_home_experts, *reference_weight.shape
+        workspace = dispatcher._get_workspace(
+            reference_weight, grad_combine_dtype=grad_combine_dtype
         )
+        home_weight_slot = dispatcher._next_home_weight_slot(workspace)
+        home_weight_view = workspace.home_weight_buffer.view(
+            _SYMMETRIC_MEMORY_BUFFER_SLOTS,
+            dispatcher.num_local_home_experts,
+            *reference_weight.shape,
+        )[home_weight_slot]
 
         with torch.no_grad():
-            for local_home_idx, weight in enumerate(local_home_weights):
-                home_weight_view[local_home_idx].copy_(weight.detach())
+            for local_home_idx in metadata.active_local_home_indices:
+                home_weight_view[local_home_idx].copy_(
+                    local_home_weights[local_home_idx].detach()
+                )
+        dispatcher._debug_staged_home_experts = len(metadata.active_local_home_indices)
 
         workspace.home_weight_handle.barrier()
+        dispatcher._debug_home_weight_barriers += 1
 
         outputs: list[torch.Tensor] = [
-            reference_weight.new_zeros(reference_weight.shape)
+            torch.zeros(
+                reference_weight.shape,
+                dtype=runtime_weight_dtype,
+                device=reference_weight.device,
+            )
             for _ in range(dispatcher.num_local_spare_experts)
         ]
-        for local_spare_idx in range(dispatcher.num_local_spare_experts):
-            home_idx = int(metadata.local_spare_home_indices[local_spare_idx].item())
-            if home_idx < 0:
+        representative_outputs: dict[int, torch.Tensor] = {}
+        for local_spare_idx, source in enumerate(metadata.local_spare_sources):
+            if source is None:
                 continue
 
-            source_rank = home_idx // dispatcher.num_local_home_experts
-            source_local_home = home_idx % dispatcher.num_local_home_experts
-            output = torch.empty_like(reference_weight)
+            source_rank, source_local_home = source
             if source_rank == dispatcher.ep_rank:
-                output.copy_(home_weight_view[source_local_home])
-            else:
-                offset = source_local_home * weight_numel
+                output = local_home_weights[source_local_home].to(dtype=runtime_weight_dtype)
+                outputs[local_spare_idx] = output
+                continue
+
+            representative_local_spare_idx = metadata.remote_spare_aliases[local_spare_idx]
+            if representative_local_spare_idx is None:
+                raise RuntimeError(
+                    "Symmetric Memory expert-weight dispatch missing a representative slot for "
+                    f"remote local spare {local_spare_idx}."
+                )
+            if representative_local_spare_idx not in representative_outputs:
+                remote_weight = torch.empty_like(reference_weight)
+                offset = (
+                    home_weight_slot * dispatcher.num_local_home_experts + source_local_home
+                ) * weight_numel
                 dispatcher._copy_from_symmetric_peer(
-                    output.contiguous().view(-1),
+                    remote_weight.contiguous().view(-1),
                     workspace.home_weight_handle,
                     peer=source_rank,
                     offset=offset,
                 )
+                output = remote_weight.to(dtype=runtime_weight_dtype)
+                representative_outputs[representative_local_spare_idx] = output
+            else:
+                output = representative_outputs[representative_local_spare_idx].clone()
+                dispatcher._debug_duplicate_remote_reads_avoided += 1
             outputs[local_spare_idx] = output
-
-        workspace.home_weight_handle.barrier()
+        dispatcher._debug_unique_remote_sources = len(representative_outputs)
 
         ctx.dispatcher = dispatcher
         ctx.dispatch_metadata = metadata
         ctx.workspace = workspace
         ctx.weight_shape = tuple(reference_weight.shape)
         ctx.weight_dtype = reference_weight.dtype
+        ctx.grad_combine_dtype = grad_combine_dtype
         ctx.weight_device = reference_weight.device
         ctx.weight_numel = weight_numel
 
@@ -414,43 +608,67 @@ class _SymmetricMemoryExpertWeightDispatch(torch.autograd.Function):
         dispatcher: SymmetricMemoryExpertWeightDispatcher = ctx.dispatcher
         metadata: ExpertWeightDispatchMetadata = ctx.dispatch_metadata
         workspace: _SymmetricExpertWeightDispatchWorkspace = ctx.workspace
+        grad_combine_dtype = ctx.grad_combine_dtype
 
+        spare_grad_slot = dispatcher._next_spare_grad_slot(workspace)
         spare_grad_view = workspace.spare_grad_buffer.view(
-            dispatcher.num_local_spare_experts, *ctx.weight_shape
-        )
+            _SYMMETRIC_MEMORY_BUFFER_SLOTS,
+            dispatcher.num_local_spare_experts,
+            *ctx.weight_shape,
+        )[spare_grad_slot]
         with torch.no_grad():
             spare_grad_view.zero_()
             for local_spare_idx in metadata.recv_local_spare_indices:
                 grad_output = grad_outputs[local_spare_idx]
                 if grad_output is not None:
-                    spare_grad_view[local_spare_idx].copy_(grad_output.detach())
+                    spare_grad_view[local_spare_idx].copy_(
+                        grad_output.detach().to(dtype=grad_combine_dtype)
+                    )
 
         workspace.spare_grad_handle.barrier()
+        dispatcher._debug_spare_grad_barriers += 1
 
         local_home_grads = [
-            torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device)
+            torch.zeros(ctx.weight_shape, dtype=grad_combine_dtype, device=ctx.weight_device)
             for _ in range(dispatcher.num_local_home_experts)
         ]
 
-        for spare_idx in range(dispatcher.num_spare_experts):
-            home_indices = torch.where(metadata.global_routing_map[:, spare_idx])[0]
-            if home_indices.numel() == 0:
-                continue
-            home_idx = int(home_indices.item())
-            source_rank = home_idx // dispatcher.num_local_home_experts
-            if source_rank != dispatcher.ep_rank:
-                continue
-
-            source_local_home = home_idx % dispatcher.num_local_home_experts
-            dest_rank = spare_idx // dispatcher.num_local_spare_experts
-            dest_local_spare = spare_idx % dispatcher.num_local_spare_experts
+        dispatcher._debug_backward_schedule_entries = len(metadata.backward_grad_sources)
+        for (
+            dest_rank,
+            dest_local_spare,
+            source_local_home,
+            dest_spare_offset,
+        ) in metadata.backward_grad_sources:
+            if source_local_home < 0 or source_local_home >= dispatcher.num_local_home_experts:
+                raise RuntimeError(
+                    "Symmetric Memory backward schedule has an invalid local home index: "
+                    f"{source_local_home}."
+                )
+            if dest_rank < 0 or dest_rank >= dispatcher.ep_size:
+                raise RuntimeError(
+                    "Symmetric Memory backward schedule has an invalid destination rank: "
+                    f"{dest_rank}."
+                )
+            if dest_local_spare < 0 or dest_local_spare >= dispatcher.num_local_spare_experts:
+                raise RuntimeError(
+                    "Symmetric Memory backward schedule has an invalid local spare index: "
+                    f"{dest_local_spare}."
+                )
+            if dest_spare_offset < 0 or dest_spare_offset >= dispatcher.num_local_spare_experts:
+                raise RuntimeError(
+                    "Symmetric Memory backward schedule has an invalid spare-gradient offset: "
+                    f"{dest_spare_offset}."
+                )
             if dest_rank == dispatcher.ep_rank:
                 local_home_grads[source_local_home].add_(spare_grad_view[dest_local_spare])
             else:
                 tmp_grad = torch.empty(
-                    ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device
+                    ctx.weight_shape, dtype=grad_combine_dtype, device=ctx.weight_device
                 )
-                offset = dest_local_spare * ctx.weight_numel
+                offset = (
+                    spare_grad_slot * dispatcher.num_local_spare_experts + dest_spare_offset
+                ) * ctx.weight_numel
                 dispatcher._copy_from_symmetric_peer(
                     tmp_grad.contiguous().view(-1),
                     workspace.spare_grad_handle,
@@ -459,9 +677,7 @@ class _SymmetricMemoryExpertWeightDispatch(torch.autograd.Function):
                 )
                 local_home_grads[source_local_home].add_(tmp_grad)
 
-        workspace.spare_grad_handle.barrier()
-
-        return (None, None, *local_home_grads)
+        return (None, None, None, None, *local_home_grads)
 
 
 class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
@@ -483,8 +699,16 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
         self._symm_mem = _get_symmetric_memory_module()
         _enable_symmetric_memory_for_group(self._symm_mem, ep_group)
         self._debug_low_level_get_calls = 0
+        self._debug_staged_home_experts = 0
+        self._debug_unique_remote_sources = 0
+        self._debug_duplicate_remote_reads_avoided = 0
+        self._debug_home_weight_barriers = 0
+        self._debug_spare_grad_barriers = 0
+        self._debug_backward_schedule_entries = 0
+        self._debug_workspace_sync_mode = "double_buffered_stage_barrier"
         self._workspaces: dict[
-            tuple[tuple[int, ...], torch.dtype, str], _SymmetricExpertWeightDispatchWorkspace
+            tuple[tuple[int, ...], torch.dtype, str, torch.dtype],
+            _SymmetricExpertWeightDispatchWorkspace,
         ] = {}
 
     @staticmethod
@@ -496,6 +720,16 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
         except RuntimeError as exc:
             return str(exc)
         return None
+
+    def _reset_debug_counters(self) -> None:
+        self._debug_low_level_get_calls = 0
+        self._debug_staged_home_experts = 0
+        self._debug_unique_remote_sources = 0
+        self._debug_duplicate_remote_reads_avoided = 0
+        self._debug_home_weight_barriers = 0
+        self._debug_spare_grad_barriers = 0
+        self._debug_backward_schedule_entries = 0
+        self._debug_workspace_sync_mode = "double_buffered_stage_barrier"
 
     def _validate_weights(self, local_home_weights: tuple[torch.Tensor, ...]) -> None:
         if len(local_home_weights) != self.num_local_home_experts:
@@ -525,21 +759,36 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
                 )
 
     def _get_workspace(
-        self, reference_weight: torch.Tensor
+        self,
+        reference_weight: torch.Tensor,
+        *,
+        grad_combine_dtype: Optional[torch.dtype] = None,
+        reference_weight_dtype: Optional[torch.dtype] = None,
     ) -> _SymmetricExpertWeightDispatchWorkspace:
-        key = (tuple(reference_weight.shape), reference_weight.dtype, str(reference_weight.device))
+        weight_dtype = reference_weight_dtype or reference_weight.dtype
+        if grad_combine_dtype is None:
+            grad_combine_dtype = self._grad_combine_dtype(weight_dtype)
+        key = (
+            tuple(reference_weight.shape),
+            weight_dtype,
+            str(reference_weight.device),
+            grad_combine_dtype,
+        )
         workspace = self._workspaces.get(key)
         if workspace is not None:
             return workspace
 
         weight_numel = reference_weight.numel()
         device = reference_weight.device
-        dtype = reference_weight.dtype
         home_weight_buffer = self._symm_mem.empty(
-            self.num_local_home_experts * weight_numel, dtype=dtype, device=device
+            _SYMMETRIC_MEMORY_BUFFER_SLOTS * self.num_local_home_experts * weight_numel,
+            dtype=weight_dtype,
+            device=device,
         )
         spare_grad_buffer = self._symm_mem.empty(
-            self.num_local_spare_experts * weight_numel, dtype=dtype, device=device
+            _SYMMETRIC_MEMORY_BUFFER_SLOTS * self.num_local_spare_experts * weight_numel,
+            dtype=grad_combine_dtype,
+            device=device,
         )
         workspace = _SymmetricExpertWeightDispatchWorkspace(
             home_weight_buffer=home_weight_buffer,
@@ -553,6 +802,20 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
         )
         self._workspaces[key] = workspace
         return workspace
+
+    def _next_home_weight_slot(
+        self, workspace: _SymmetricExpertWeightDispatchWorkspace
+    ) -> int:
+        slot = workspace.next_home_weight_slot
+        workspace.next_home_weight_slot = (slot + 1) % _SYMMETRIC_MEMORY_BUFFER_SLOTS
+        return slot
+
+    def _next_spare_grad_slot(
+        self, workspace: _SymmetricExpertWeightDispatchWorkspace
+    ) -> int:
+        slot = workspace.next_spare_grad_slot
+        workspace.next_spare_grad_slot = (slot + 1) % _SYMMETRIC_MEMORY_BUFFER_SLOTS
+        return slot
 
     def _copy_from_symmetric_peer(
         self, dst_flat: torch.Tensor, handle, *, peer: int, offset: int
@@ -571,10 +834,84 @@ class SymmetricMemoryExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
         dst_flat.copy_(peer_buffer[offset : offset + dst_flat.numel()])
 
     def dispatch(
-        self, metadata: ExpertWeightDispatchMetadata, *expert_weights: torch.Tensor
+        self,
+        metadata: ExpertWeightDispatchMetadata,
+        *expert_weights: torch.Tensor,
+        runtime_weight_dtype: Optional[torch.dtype] = None,
     ) -> list[torch.Tensor]:
-        outputs = _SymmetricMemoryExpertWeightDispatch.apply(self, metadata, *expert_weights)
+        if not expert_weights:
+            raise ValueError("At least one local home weight is required.")
+        outputs = _SymmetricMemoryExpertWeightDispatch.apply(
+            self,
+            metadata,
+            runtime_weight_dtype,
+            self._grad_combine_dtype(expert_weights[0].dtype),
+            *expert_weights,
+        )
         return list(outputs)
+
+    def fold_spare_gradients(
+        self,
+        metadata: ExpertWeightDispatchMetadata,
+        *local_spare_grads: torch.Tensor,
+        reference_weight_dtype: Optional[torch.dtype] = None,
+    ) -> list[torch.Tensor]:
+        """Fold local spare-slot gradients through low-level SymmMem reads."""
+
+        if not local_spare_grads:
+            raise ValueError("At least one local spare gradient is required.")
+        reference_grad = local_spare_grads[0]
+        effective_weight_dtype = reference_weight_dtype or reference_grad.dtype
+        grad_combine_dtype = self._grad_combine_dtype(effective_weight_dtype)
+        workspace = self._get_workspace(
+            reference_grad,
+            grad_combine_dtype=grad_combine_dtype,
+            reference_weight_dtype=effective_weight_dtype,
+        )
+        spare_grad_slot = self._next_spare_grad_slot(workspace)
+        spare_grad_view = workspace.spare_grad_buffer.view(
+            _SYMMETRIC_MEMORY_BUFFER_SLOTS,
+            self.num_local_spare_experts,
+            *reference_grad.shape,
+        )[spare_grad_slot]
+
+        with torch.no_grad():
+            spare_grad_view.zero_()
+            for local_spare_idx in metadata.recv_local_spare_indices:
+                spare_grad_view[local_spare_idx].copy_(
+                    local_spare_grads[local_spare_idx].detach().to(dtype=grad_combine_dtype)
+                )
+
+        workspace.spare_grad_handle.barrier()
+        self._debug_spare_grad_barriers += 1
+
+        local_home_grads = [
+            torch.zeros(reference_grad.shape, dtype=grad_combine_dtype, device=reference_grad.device)
+            for _ in range(self.num_local_home_experts)
+        ]
+        for (
+            dest_rank,
+            dest_local_spare,
+            source_local_home,
+            dest_spare_offset,
+        ) in metadata.backward_grad_sources:
+            if dest_rank == self.ep_rank:
+                local_home_grads[source_local_home].add_(spare_grad_view[dest_local_spare])
+            else:
+                tmp_grad = torch.empty(
+                    reference_grad.shape, dtype=grad_combine_dtype, device=reference_grad.device
+                )
+                offset = (
+                    spare_grad_slot * self.num_local_spare_experts + dest_spare_offset
+                ) * reference_grad.numel()
+                self._copy_from_symmetric_peer(
+                    tmp_grad.contiguous().view(-1),
+                    workspace.spare_grad_handle,
+                    peer=dest_rank,
+                    offset=offset,
+                )
+                local_home_grads[source_local_home].add_(tmp_grad)
+        return local_home_grads
 
 
 class _HybridEPExpertWeightChunkDispatch(torch.autograd.Function):
@@ -909,7 +1246,10 @@ class HybridEPExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
         return flat_chunks.contiguous(), chunk_routing_map.contiguous()
 
     def dispatch(
-        self, metadata: ExpertWeightDispatchMetadata, *expert_weights: torch.Tensor
+        self,
+        metadata: ExpertWeightDispatchMetadata,
+        *expert_weights: torch.Tensor,
+        runtime_weight_dtype: Optional[torch.dtype] = None,
     ) -> list[torch.Tensor]:
         availability_error = self.availability_error()
         if availability_error is not None:
@@ -917,6 +1257,11 @@ class HybridEPExpertWeightDispatcher(AllToAllExpertWeightDispatcher):
         self._validate_weights(expert_weights)
 
         reference_weight = expert_weights[0]
+        if runtime_weight_dtype is not None and runtime_weight_dtype != reference_weight.dtype:
+            raise ValueError(
+                "HybridEP expert-weight dispatch does not support overriding "
+                "runtime_weight_dtype."
+            )
         zero_home_dependency = reference_weight.new_zeros(())
         for weight in expert_weights:
             zero_home_dependency = zero_home_dependency + weight.sum() * 0.0

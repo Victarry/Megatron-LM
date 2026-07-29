@@ -875,6 +875,21 @@ class TransformerConfig(ModelParallelConfig):
     moe_use_balanced_layer: bool = False
     """Use BalancedMoELayer for MoE layers."""
 
+    moe_balance_backend: Literal["legacy", "moonep"] = "legacy"
+    """BalancedMoELayer data plane. ``legacy`` preserves the existing planner and dispatchers."""
+
+    moe_balance_moonep_num_sms: Optional[int] = None
+    """Number of SMs used by MoonEP communication kernels; None uses MoonEP's default."""
+
+    moe_balance_moonep_token_padding: int = 128
+    """Per-VM-group token alignment used by MoonEP."""
+
+    moe_balance_moonep_comm_stream_priority: int = -1
+    """Priority of the MoonEP communication stream."""
+
+    moe_balance_moonep_enable_pdl: bool = True
+    """Enable MoonEP programmatic dependent launch."""
+
     moe_num_spare_experts: Optional[int] = None
     """Number of runtime spare expert slots across the expert-parallel group."""
 
@@ -902,6 +917,16 @@ class TransformerConfig(ModelParallelConfig):
         "all_to_all", "symmetric_memory", "hybridep"
     ] = "all_to_all"
     """Expert-weight dispatch backend for BalancedMoELayer runtime spare weights."""
+
+    moe_balance_expert_weight_grad_combine_dtype: Literal[
+        "fp32", "param_dtype", "bf16", "fp16"
+    ] = "fp32"
+    """Gradient combine dtype for BalancedMoELayer expert-weight dispatch backward.
+
+    ``fp32`` preserves the default behavior by folding BF16/FP16 spare gradients in FP32.
+    ``param_dtype`` folds in the expert weight dtype. ``bf16`` and ``fp16`` force the
+    combine dtype explicitly.
+    """
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
@@ -1892,16 +1917,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
 
         if self.moe_use_balanced_layer:
-            if self.moe_balance_expert_weight_dispatch_backend not in (
-                "all_to_all",
-                "symmetric_memory",
-                "hybridep",
-            ):
-                raise ValueError(
-                    "BalancedMoELayer requires "
-                    "moe_balance_expert_weight_dispatch_backend to be one of "
-                    "'all_to_all', 'symmetric_memory', or 'hybridep'."
-                )
+            if self.moe_balance_backend not in ("legacy", "moonep"):
+                raise ValueError("moe_balance_backend must be 'legacy' or 'moonep'.")
             if self.num_moe_experts is None:
                 raise ValueError("BalancedMoELayer requires num_moe_experts.")
             if self.moe_ffn_hidden_size is None:
@@ -1910,26 +1927,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("BalancedMoELayer requires expert_model_parallel_size > 1.")
             if self.num_moe_experts % self.expert_model_parallel_size != 0:
                 raise ValueError("BalancedMoELayer requires num_moe_experts divisible by EP size.")
-            if self.moe_num_spare_experts is None or self.moe_num_spare_experts <= 0:
-                raise ValueError("BalancedMoELayer requires a positive moe_num_spare_experts.")
-            if self.moe_num_spare_experts % self.expert_model_parallel_size != 0:
-                raise ValueError(
-                    "BalancedMoELayer requires moe_num_spare_experts divisible by EP size."
-                )
-            if self.moe_token_dispatcher_type != "alltoall":
-                raise ValueError("BalancedMoELayer requires moe_token_dispatcher_type='alltoall'.")
-            spare_per_rank = self.moe_num_spare_experts // self.expert_model_parallel_size
-            if (
-                self.moe_balance_assignment_algorithm == "approx_bin_packing"
-                and spare_per_rank != 1
-            ):
-                raise ValueError(
-                    "BalancedMoELayer approx_bin_packing supports one spare per EP rank."
-                )
             if self.cuda_graph_impl != "none":
-                raise ValueError("BalancedMoELayer does not support CUDA Graph in the MVP.")
+                raise ValueError("BalancedMoELayer does not support CUDA Graph.")
             if self.fp8 is not None or self.fp4 is not None:
-                raise ValueError("BalancedMoELayer does not support FP8 or FP4 in the MVP.")
+                raise ValueError("BalancedMoELayer does not support FP8 or FP4.")
             if self.moe_router_padding_for_fp8 or self.moe_router_padding_for_quantization:
                 raise ValueError("BalancedMoELayer does not support quantization router padding.")
             if self.transformer_impl == "inference_optimized":
@@ -1948,6 +1949,116 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("BalancedMoELayer does not support delayed wgrad compute.")
             if self.overlap_dispatch_backward_with_experts_wgrad:
                 raise ValueError("BalancedMoELayer does not support dispatch-backward overlap.")
+
+            if self.moe_balance_backend == "moonep":
+                if not self.bf16 or self.fp16:
+                    raise ValueError("MoonEP BalancedMoELayer requires BF16 precision.")
+                if self.moe_router_dtype != "fp32":
+                    raise ValueError("MoonEP BalancedMoELayer requires moe_router_dtype='fp32'.")
+                if not self.moe_grouped_gemm:
+                    raise ValueError("MoonEP BalancedMoELayer requires moe_grouped_gemm=True.")
+                if self.add_bias_linear:
+                    raise ValueError("MoonEP BalancedMoELayer does not support expert bias.")
+                if self.moe_num_spare_experts is not None:
+                    raise ValueError(
+                        "moe_num_spare_experts is legacy-only; MoonEP fixes B to E / EP."
+                    )
+                if self.moe_balance_assignment_algorithm != "approx_bin_packing":
+                    raise ValueError(
+                        "moe_balance_assignment_algorithm is legacy-only under MoonEP."
+                    )
+                if self.moe_balance_enable_random_offloading:
+                    raise ValueError(
+                        "moe_balance_enable_random_offloading is legacy-only under MoonEP."
+                    )
+                if self.moe_balance_threshold_multiplier != 0.0:
+                    raise ValueError(
+                        "moe_balance_threshold_multiplier is legacy-only under MoonEP."
+                    )
+                if self.moe_balance_expert_weight_dispatch_backend != "all_to_all":
+                    raise ValueError(
+                        "moe_balance_expert_weight_dispatch_backend is legacy-only under MoonEP."
+                    )
+                if self.moe_balance_expert_weight_grad_combine_dtype != "fp32":
+                    raise ValueError("MoonEP weight-gradient reduction is fixed to FP32.")
+                if self.moe_balance_recompute_expert_dispatch:
+                    raise ValueError(
+                        "MoonEP does not support explicit expert-dispatch recompute."
+                    )
+                if self.moe_expert_capacity_factor is not None or self.moe_token_dropping:
+                    raise ValueError("MoonEP does not support token dropping or expert capacity.")
+                if self.cpu_offloading:
+                    raise ValueError("MoonEP does not support CPU offload.")
+                if self.pipeline_model_parallel_size > 1:
+                    raise ValueError("MoonEP first version requires pipeline parallel size 1.")
+                if self.tensor_model_parallel_size > 1:
+                    raise ValueError("MoonEP first version requires tensor parallel size 1.")
+                if self.recompute_granularity == "full" or (
+                    self.recompute_granularity == "selective"
+                    and "moe" in (self.recompute_modules or [])
+                ):
+                    raise ValueError("MoonEP does not support MoE activation recompute.")
+                if self.moe_balance_moonep_num_sms is not None and (
+                    self.moe_balance_moonep_num_sms <= 0
+                ):
+                    raise ValueError("moe_balance_moonep_num_sms must be positive.")
+                if self.moe_balance_moonep_token_padding <= 0:
+                    raise ValueError("moe_balance_moonep_token_padding must be positive.")
+            else:
+                if self.moe_balance_expert_weight_grad_combine_dtype not in (
+                    "fp32",
+                    "param_dtype",
+                    "bf16",
+                    "fp16",
+                ):
+                    raise ValueError(
+                        "BalancedMoELayer requires "
+                        "moe_balance_expert_weight_grad_combine_dtype to be one of "
+                        "'fp32', 'param_dtype', 'bf16', or 'fp16'."
+                    )
+                if self.moe_balance_expert_weight_dispatch_backend not in (
+                    "all_to_all",
+                    "symmetric_memory",
+                    "hybridep",
+                ):
+                    raise ValueError(
+                        "BalancedMoELayer requires "
+                        "moe_balance_expert_weight_dispatch_backend to be one of "
+                        "'all_to_all', 'symmetric_memory', or 'hybridep'."
+                    )
+                if self.moe_balance_expert_weight_dispatch_backend == "hybridep":
+                    if self.moe_balance_expert_weight_grad_combine_dtype != "param_dtype":
+                        raise ValueError(
+                            "BalancedMoELayer HybridEP expert-weight dispatch currently requires "
+                            "moe_balance_expert_weight_grad_combine_dtype='param_dtype'."
+                        )
+                    if self.moe_grouped_gemm:
+                        raise ValueError(
+                            "BalancedMoELayer HybridEP does not support TEGroupedMLP foldback."
+                        )
+                if self.moe_grouped_gemm and self.moe_balance_recompute_expert_dispatch:
+                    raise ValueError(
+                        "BalancedMoELayer does not support recompute_expert_dispatch with "
+                        "TEGroupedMLP runtime main_grad foldback."
+                    )
+                if self.moe_num_spare_experts is None or self.moe_num_spare_experts <= 0:
+                    raise ValueError("BalancedMoELayer requires a positive moe_num_spare_experts.")
+                if self.moe_num_spare_experts % self.expert_model_parallel_size != 0:
+                    raise ValueError(
+                        "BalancedMoELayer requires moe_num_spare_experts divisible by EP size."
+                    )
+                if self.moe_token_dispatcher_type != "alltoall":
+                    raise ValueError(
+                        "BalancedMoELayer requires moe_token_dispatcher_type='alltoall'."
+                    )
+                spare_per_rank = self.moe_num_spare_experts // self.expert_model_parallel_size
+                if (
+                    self.moe_balance_assignment_algorithm == "approx_bin_packing"
+                    and spare_per_rank != 1
+                ):
+                    raise ValueError(
+                        "BalancedMoELayer approx_bin_packing supports one spare per EP rank."
+                    )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":

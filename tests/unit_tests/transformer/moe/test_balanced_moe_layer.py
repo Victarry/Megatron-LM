@@ -77,6 +77,7 @@ def _make_config(
     shared_expert=False,
     recompute_expert_dispatch=False,
     expert_weight_backend="all_to_all",
+    grad_combine_dtype="fp32",
 ):
     config = TransformerConfig(
         num_layers=1,
@@ -110,6 +111,7 @@ def _make_config(
         config.moe_balance_enable_debug_stats = True
         config.moe_balance_recompute_expert_dispatch = recompute_expert_dispatch
         config.moe_balance_expert_weight_dispatch_backend = expert_weight_backend
+        config.moe_balance_expert_weight_grad_combine_dtype = grad_combine_dtype
     return config
 
 
@@ -134,6 +136,7 @@ def _balanced_config_kwargs(**overrides):
         "moe_num_spare_experts": 4,
         "moe_balance_assignment_algorithm": "approx_bin_packing",
         "moe_balance_expert_weight_dispatch_backend": "all_to_all",
+        "moe_balance_expert_weight_grad_combine_dtype": "fp32",
     }
     kwargs.update(overrides)
     return kwargs
@@ -247,34 +250,45 @@ def _run_layer(layer, hidden_states, output_grad, **forward_kwargs):
     return output.detach()
 
 
-def _assert_router_grads_close(baseline, balanced, dtype):
+def _assert_router_grads_close(baseline, balanced):
     for baseline_param, balanced_param in zip(
         baseline.router.parameters(), balanced.router.parameters()
     ):
-        _assert_grad_close(balanced_param, baseline_param, dtype)
+        _assert_grad_close(balanced_param, baseline_param)
 
 
-def _assert_grad_close(actual_param, expected_param, dtype):
-    if expected_param.grad is None or actual_param.grad is None:
-        assert actual_param.grad is None
-        assert expected_param.grad is None
+def _assert_grad_close(actual_param, expected_param, *, rtol=None, atol=None):
+    actual_grad = getattr(actual_param, "main_grad", None)
+    expected_grad = getattr(expected_param, "main_grad", None)
+    if actual_grad is None:
+        actual_grad = actual_param.grad
+    if expected_grad is None:
+        expected_grad = expected_param.grad
+    if expected_grad is None or actual_grad is None:
+        assert actual_grad is None
+        assert expected_grad is None
         return
-    torch.testing.assert_close(
-        actual_param.grad,
-        expected_param.grad,
-        rtol=2e-2 if dtype is torch.bfloat16 else 1e-5,
-        atol=2e-2 if dtype is torch.bfloat16 else 1e-6,
-    )
+    assert_close_kwargs = {}
+    if rtol is not None:
+        assert_close_kwargs["rtol"] = rtol
+    if atol is not None:
+        assert_close_kwargs["atol"] = atol
+    if actual_grad.dtype != expected_grad.dtype:
+        torch.testing.assert_close(
+            actual_grad.to(dtype=expected_grad.dtype), expected_grad, **assert_close_kwargs
+        )
+    else:
+        torch.testing.assert_close(actual_grad, expected_grad, **assert_close_kwargs)
 
 
-def _assert_home_expert_grads_close(baseline, balanced, dtype):
+def _assert_home_expert_grads_close(baseline, balanced, *, rtol=None, atol=None):
     if hasattr(baseline.experts, "local_experts"):
         for local_idx, baseline_expert in enumerate(baseline.experts.local_experts):
             balanced_expert = balanced.experts.local_experts[local_idx]
             for baseline_param, balanced_param in zip(
                 baseline_expert.parameters(), balanced_expert.parameters()
             ):
-                _assert_grad_close(balanced_param, baseline_param, dtype)
+                _assert_grad_close(balanced_param, baseline_param, rtol=rtol, atol=atol)
         return
 
     for module_name in ("linear_fc1", "linear_fc2"):
@@ -285,11 +299,14 @@ def _assert_home_expert_grads_close(baseline, balanced, dtype):
                 name = f"{prefix}{local_idx}"
                 if hasattr(baseline_layer, name):
                     _assert_grad_close(
-                        getattr(balanced_layer, name), getattr(baseline_layer, name), dtype
+                        getattr(balanced_layer, name),
+                        getattr(baseline_layer, name),
+                        rtol=rtol,
+                        atol=atol,
                     )
 
 
-def _assert_shared_expert_grads_close(baseline, balanced, dtype):
+def _assert_shared_expert_grads_close(baseline, balanced):
     if baseline.shared_experts is None:
         assert balanced.shared_experts is None
         return
@@ -297,7 +314,7 @@ def _assert_shared_expert_grads_close(baseline, balanced, dtype):
     for baseline_param, balanced_param in zip(
         baseline.shared_experts.parameters(), balanced.shared_experts.parameters()
     ):
-        _assert_grad_close(balanced_param, baseline_param, dtype)
+        _assert_grad_close(balanced_param, baseline_param)
 
 
 def _assert_no_spare_parameters(balanced):
@@ -348,14 +365,10 @@ def test_balanced_moe_layer_parity(monkeypatch, mode, topk, dtype):
         baseline_output = _run_layer(baseline, hidden, output_grad)
         balanced_output = _run_layer(balanced, balanced_hidden, output_grad)
 
-        if dtype is torch.bfloat16:
-            torch.testing.assert_close(balanced_output, baseline_output, rtol=2e-2, atol=2e-2)
-            torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=2e-2, atol=2e-2)
-        else:
-            torch.testing.assert_close(balanced_output, baseline_output, rtol=1e-5, atol=1e-6)
-            torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=1e-5, atol=1e-6)
-        _assert_router_grads_close(baseline, balanced, dtype)
-        _assert_home_expert_grads_close(baseline, balanced, dtype)
+        torch.testing.assert_close(balanced_output, baseline_output)
+        torch.testing.assert_close(balanced_hidden.grad, hidden.grad)
+        _assert_router_grads_close(baseline, balanced)
+        _assert_home_expert_grads_close(baseline, balanced)
         _assert_no_spare_parameters(balanced)
 
         if mode != "no_move":
@@ -386,12 +399,14 @@ def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weigh
         original_dispatch = dispatcher_cls.dispatch
         dispatch_calls = {"no_grad": 0, "grad": 0}
 
-        def counted_dispatch(self, metadata, *expert_weights):
+        def counted_dispatch(self, metadata, *expert_weights, runtime_weight_dtype=None):
             if torch.is_grad_enabled():
                 dispatch_calls["grad"] += 1
             else:
                 dispatch_calls["no_grad"] += 1
-            return original_dispatch(self, metadata, *expert_weights)
+            return original_dispatch(
+                self, metadata, *expert_weights, runtime_weight_dtype=runtime_weight_dtype
+            )
 
         monkeypatch.setattr(dispatcher_cls, "dispatch", counted_dispatch)
 
@@ -404,6 +419,9 @@ def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weigh
             balanced=True,
             recompute_expert_dispatch=True,
             expert_weight_backend=expert_weight_backend,
+            grad_combine_dtype=(
+                "param_dtype" if expert_weight_backend == "hybridep" else "fp32"
+            ),
         )
         balanced = balanced_cls(balanced_config, _submodules(), layer_number=1)
         assert isinstance(balanced.expert_weight_dispatcher, dispatcher_cls)
@@ -418,14 +436,13 @@ def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weigh
         baseline_output = _run_layer(baseline, hidden, output_grad)
         balanced_output = _run_layer(balanced, balanced_hidden, output_grad)
 
-        if dtype is torch.bfloat16:
-            torch.testing.assert_close(balanced_output, baseline_output, rtol=2e-2, atol=2e-2)
-            torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(balanced_output, baseline_output)
+        torch.testing.assert_close(balanced_hidden.grad, hidden.grad)
+        _assert_router_grads_close(baseline, balanced)
+        if expert_weight_backend == "hybridep":
+            _assert_home_expert_grads_close(baseline, balanced, rtol=2e-2, atol=2e-2)
         else:
-            torch.testing.assert_close(balanced_output, baseline_output, rtol=1e-5, atol=1e-6)
-            torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=1e-5, atol=1e-6)
-        _assert_router_grads_close(baseline, balanced, dtype)
-        _assert_home_expert_grads_close(baseline, balanced, dtype)
+            _assert_home_expert_grads_close(baseline, balanced)
         _assert_no_spare_parameters(balanced)
         assert dispatch_calls["no_grad"] == 2
         assert dispatch_calls["grad"] == 2
@@ -442,6 +459,26 @@ def test_balanced_moe_layer_recomputes_expert_dispatch(monkeypatch, expert_weigh
         (
             {"moe_balance_expert_weight_dispatch_backend": "invalid"},
             "expert_weight_dispatch_backend",
+        ),
+        (
+            {"moe_balance_expert_weight_grad_combine_dtype": "invalid"},
+            "expert_weight_grad_combine_dtype",
+        ),
+        (
+            {"moe_balance_expert_weight_dispatch_backend": "hybridep"},
+            "grad_combine_dtype='param_dtype'",
+        ),
+        (
+            {
+                "moe_balance_expert_weight_dispatch_backend": "hybridep",
+                "moe_balance_expert_weight_grad_combine_dtype": "param_dtype",
+                "moe_grouped_gemm": True,
+            },
+            "TEGroupedMLP runtime main_grad foldback",
+        ),
+        (
+            {"moe_grouped_gemm": True, "moe_balance_recompute_expert_dispatch": True},
+            "recompute_expert_dispatch",
         ),
         ({"moe_num_spare_experts": 8}, "one spare per EP rank"),
         ({"moe_token_dispatcher_type": "allgather"}, "moe_token_dispatcher_type='alltoall'"),
@@ -566,10 +603,10 @@ def test_balanced_moe_layer_symmetric_memory_backend_parity(monkeypatch, mode):
         baseline_output = _run_layer(baseline, hidden, output_grad)
         balanced_output = _run_layer(balanced, balanced_hidden, output_grad)
 
-        torch.testing.assert_close(balanced_output, baseline_output, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=1e-5, atol=1e-6)
-        _assert_router_grads_close(baseline, balanced, dtype)
-        _assert_home_expert_grads_close(baseline, balanced, dtype)
+        torch.testing.assert_close(balanced_output, baseline_output)
+        torch.testing.assert_close(balanced_hidden.grad, hidden.grad)
+        _assert_router_grads_close(baseline, balanced)
+        _assert_home_expert_grads_close(baseline, balanced)
         _assert_no_spare_parameters(balanced)
         assert balanced.last_debug_stats is not None
         assert balanced.last_debug_stats.num_global_active_spare_slots > 0
@@ -619,11 +656,11 @@ def test_balanced_moe_layer_padding_mask_and_shared_expert_parity(
         baseline_output = _run_layer(baseline, hidden, output_grad, **forward_kwargs)
         balanced_output = _run_layer(balanced, balanced_hidden, output_grad, **forward_kwargs)
 
-        torch.testing.assert_close(balanced_output, baseline_output, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=1e-5, atol=1e-6)
-        _assert_router_grads_close(baseline, balanced, dtype)
-        _assert_home_expert_grads_close(baseline, balanced, dtype)
-        _assert_shared_expert_grads_close(baseline, balanced, dtype)
+        torch.testing.assert_close(balanced_output, baseline_output)
+        torch.testing.assert_close(balanced_hidden.grad, hidden.grad)
+        _assert_router_grads_close(baseline, balanced)
+        _assert_home_expert_grads_close(baseline, balanced)
+        _assert_shared_expert_grads_close(baseline, balanced)
         _assert_no_spare_parameters(balanced)
 
         if feature == "shared_expert":
@@ -677,10 +714,10 @@ def test_balanced_moe_layer_te_grouped_parity(monkeypatch, mode, topk, dtype):
         baseline_output = _run_layer(baseline, hidden, output_grad)
         balanced_output = _run_layer(balanced, balanced_hidden, output_grad)
 
-        torch.testing.assert_close(balanced_output, baseline_output, rtol=2e-2, atol=2e-2)
-        torch.testing.assert_close(balanced_hidden.grad, hidden.grad, rtol=2e-2, atol=2e-2)
-        _assert_router_grads_close(baseline, balanced, dtype)
-        _assert_home_expert_grads_close(baseline, balanced, dtype)
+        torch.testing.assert_close(balanced_output, baseline_output)
+        torch.testing.assert_close(balanced_hidden.grad, hidden.grad)
+        _assert_router_grads_close(baseline, balanced)
+        _assert_home_expert_grads_close(baseline, balanced)
         _assert_no_spare_parameters(balanced)
 
         if mode != "no_move":
@@ -698,7 +735,126 @@ def test_balanced_moe_layer_te_grouped_parity(monkeypatch, mode, topk, dtype):
     not is_te_min_version("1.9.0.dev0"),
     reason="TEGroupedMLP is only supported in TE 1.9.0.dev0 and later.",
 )
-def test_balanced_moe_layer_te_grouped_runtime_weights_use_autograd_wgrad(monkeypatch):
+@pytest.mark.parametrize("expert_weight_backend", ["all_to_all", "symmetric_memory"])
+def test_balanced_moe_layer_te_grouped_runtime_weights_use_te_fp32_main_grad(
+    monkeypatch, expert_weight_backend
+):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        if expert_weight_backend == "symmetric_memory":
+            _require_symmetric_memory_backend()
+        balanced_module, balanced_cls = _require_balanced_moe_layer()
+        _patch_planner(monkeypatch, balanced_module, "forced_move")
+
+        dtype = torch.bfloat16
+        _set_random_seed(seed_=1234, data_parallel_random_init=False)
+        balanced_config = _make_config(
+            dtype, 1, balanced=True, grouped=True, expert_weight_backend=expert_weight_backend
+        )
+        balanced_config.gradient_accumulation_fusion = True
+        balanced = balanced_cls(balanced_config, _submodules(grouped=True), layer_number=1)
+        assert isinstance(balanced.experts, TEGroupedMLP)
+        assert balanced_config.gradient_accumulation_fusion
+        assert balanced.experts.linear_fc1.fuse_wgrad_accumulation
+        assert balanced.experts.linear_fc2.fuse_wgrad_accumulation
+
+        balanced.cuda().to(dtype=dtype)
+        hidden = torch.randn(6, 2, 16, device="cuda", dtype=dtype, requires_grad=True)
+        output_grad = torch.randn_like(hidden)
+        _run_layer(balanced, hidden, output_grad)
+
+        assert hidden.grad is not None
+        assert balanced._last_runtime_spare_main_grad_dtypes
+        assert all(
+            grad_dtype is torch.float32
+            for grad_dtype in balanced._last_runtime_spare_main_grad_dtypes
+        )
+        local_spare_main_grad_sum = torch.tensor(
+            sum(balanced._last_runtime_spare_main_grad_abs_sums), device=hidden.device
+        )
+        torch.distributed.all_reduce(
+            local_spare_main_grad_sum, op=torch.distributed.ReduceOp.SUM
+        )
+        assert local_spare_main_grad_sum.item() > 0.0
+
+        local_home_main_grad_sum = torch.tensor(0.0, device=hidden.device)
+        for param in balanced.experts.parameters():
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is None:
+                continue
+            assert main_grad.dtype is torch.float32
+            local_home_main_grad_sum += main_grad.abs().sum()
+        torch.distributed.all_reduce(local_home_main_grad_sum, op=torch.distributed.ReduceOp.SUM)
+        assert local_home_main_grad_sum.item() > 0.0
+        _assert_no_spare_parameters(balanced)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_TE, reason="TEGroupedMLP SymmMem parity requires Transformer Engine.")
+@pytest.mark.skipif(
+    not is_te_min_version("1.9.0.dev0"),
+    reason="TEGroupedMLP is only supported in TE 1.9.0.dev0 and later.",
+)
+def test_balanced_moe_layer_te_grouped_symmetric_memory_parity(monkeypatch):
+    _require_distributed_cuda()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    try:
+        _require_symmetric_memory_backend()
+        balanced_module, balanced_cls = _require_balanced_moe_layer()
+        _patch_planner(monkeypatch, balanced_module, "forced_move")
+
+        dtype = torch.bfloat16
+        _set_random_seed(seed_=1234, data_parallel_random_init=False)
+        baseline_config = _make_config(dtype, 1, balanced=False, grouped=True)
+        baseline = MoELayer(baseline_config, _submodules(grouped=True), layer_number=1)
+
+        balanced_config = _make_config(
+            dtype,
+            1,
+            balanced=True,
+            grouped=True,
+            expert_weight_backend="symmetric_memory",
+        )
+        balanced = balanced_cls(balanced_config, _submodules(grouped=True), layer_number=1)
+        assert isinstance(baseline.experts, TEGroupedMLP)
+        assert isinstance(balanced.experts, TEGroupedMLP)
+
+        baseline.cuda().to(dtype=dtype)
+        balanced.cuda().to(dtype=dtype)
+        _copy_home_state(baseline, balanced)
+
+        hidden = torch.randn(6, 2, 16, device="cuda", dtype=dtype, requires_grad=True)
+        balanced_hidden = hidden.detach().clone().requires_grad_(True)
+        output_grad = torch.randn_like(hidden)
+
+        baseline_output = _run_layer(baseline, hidden, output_grad)
+        balanced_output = _run_layer(balanced, balanced_hidden, output_grad)
+
+        torch.testing.assert_close(balanced_output, baseline_output)
+        torch.testing.assert_close(balanced_hidden.grad, hidden.grad)
+        _assert_router_grads_close(baseline, balanced)
+        _assert_home_expert_grads_close(baseline, balanced)
+        _assert_no_spare_parameters(balanced)
+        assert balanced._last_runtime_spare_main_grad_dtypes
+        assert balanced._last_runtime_folded_home_grad_dtypes
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not HAVE_TE, reason="TEGroupedMLP runtime wgrad combine-dtype test requires Transformer Engine."
+)
+@pytest.mark.skipif(
+    not is_te_min_version("1.9.0.dev0"),
+    reason="TEGroupedMLP is only supported in TE 1.9.0.dev0 and later.",
+)
+def test_balanced_moe_layer_te_grouped_runtime_weight_grad_combine_dtype_is_configurable(
+    monkeypatch,
+):
     _require_distributed_cuda()
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
     try:
@@ -707,21 +863,35 @@ def test_balanced_moe_layer_te_grouped_runtime_weights_use_autograd_wgrad(monkey
 
         dtype = torch.bfloat16
         _set_random_seed(seed_=1234, data_parallel_random_init=False)
-        balanced_config = _make_config(dtype, 1, balanced=True, grouped=True)
+        balanced_config = _make_config(
+            dtype,
+            1,
+            balanced=True,
+            grouped=True,
+            grad_combine_dtype="bf16",
+        )
         balanced_config.gradient_accumulation_fusion = True
         balanced = balanced_cls(balanced_config, _submodules(grouped=True), layer_number=1)
         assert isinstance(balanced.experts, TEGroupedMLP)
-        assert balanced_config.gradient_accumulation_fusion
-        assert not balanced.experts.linear_fc1.fuse_wgrad_accumulation
-        assert not balanced.experts.linear_fc2.fuse_wgrad_accumulation
 
         balanced.cuda().to(dtype=dtype)
         hidden = torch.randn(6, 2, 16, device="cuda", dtype=dtype, requires_grad=True)
         output_grad = torch.randn_like(hidden)
         _run_layer(balanced, hidden, output_grad)
 
-        assert hidden.grad is not None
-        assert any(param.grad is not None for param in balanced.experts.parameters())
-        _assert_no_spare_parameters(balanced)
+        assert balanced._last_runtime_spare_main_grad_dtypes
+        assert all(
+            grad_dtype is torch.float32
+            for grad_dtype in balanced._last_runtime_spare_main_grad_dtypes
+        )
+        assert balanced._last_runtime_folded_home_grad_dtypes
+        assert all(
+            grad_dtype is torch.bfloat16
+            for grad_dtype in balanced._last_runtime_folded_home_grad_dtypes
+        )
+        for param in balanced.experts.parameters():
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is not None:
+                assert main_grad.dtype is torch.float32
     finally:
         Utils.destroy_model_parallel()

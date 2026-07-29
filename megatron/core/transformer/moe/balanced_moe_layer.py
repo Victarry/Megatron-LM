@@ -19,6 +19,7 @@ from megatron.core.transformer.moe.expert_weight_dispatcher import (
     AllToAllExpertWeightDispatcher,
     HybridEPExpertWeightDispatcher,
     SymmetricMemoryExpertWeightDispatcher,
+    _runtime_weight_grad_edge_dtype,
 )
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
@@ -40,6 +41,42 @@ class BalancedMoEDebugStats:
     num_moved_token_assignments: int
     max_rank_load_before: int
     max_rank_load_after: int
+
+
+@dataclass(frozen=True)
+class _RuntimeMainGradFoldbackContext:
+    module: str
+    metadata: object
+    home_weights: list[torch.Tensor]
+    spare_weights: list[torch.Tensor]
+
+
+class _RuntimeExpertWeightForwardCast(torch.autograd.Function):
+    """Use low-precision weights in expert GEMMs while reducing their gradients in FP32."""
+
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor, forward_dtype: torch.dtype) -> torch.Tensor:
+        ctx.backward_dtype = weight.dtype
+        return weight.to(dtype=forward_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output.to(dtype=ctx.backward_dtype), None
+
+
+def _cast_runtime_expert_weights_for_forward(
+    expert_weights: list[torch.Tensor], forward_dtype: torch.dtype
+) -> list[torch.Tensor]:
+    """Cast runtime weights for expert forward while preserving an FP32 grad edge."""
+
+    return [
+        (
+            _RuntimeExpertWeightForwardCast.apply(expert_weight, forward_dtype)
+            if expert_weight.dtype != forward_dtype
+            else expert_weight
+        )
+        for expert_weight in expert_weights
+    ]
 
 
 class BalancedMoELayer(BaseMoELayer):
@@ -69,7 +106,12 @@ class BalancedMoELayer(BaseMoELayer):
 
         self.ep_size = utils.get_pg_size(self.ep_group)
         self.ep_rank = utils.get_pg_rank(self.ep_group)
+        self.balance_backend = getattr(self.config, "moe_balance_backend", "legacy")
         self.num_home_experts = not_none(self.config.num_moe_experts)
+        if self.balance_backend == "moonep":
+            self._init_moonep(name, pg_collection)
+            return
+
         self.num_spare_experts = not_none(getattr(self.config, "moe_num_spare_experts", None))
         self.num_local_home_experts = self.num_home_experts // self.ep_size
         self.num_local_spare_experts = self.num_spare_experts // self.ep_size
@@ -85,6 +127,9 @@ class BalancedMoELayer(BaseMoELayer):
         ]
         self.num_local_experts = self.num_local_total_experts
         self.last_debug_stats: BalancedMoEDebugStats | None = None
+        self._last_runtime_spare_main_grad_dtypes: list[torch.dtype] = []
+        self._last_runtime_spare_main_grad_abs_sums: list[float] = []
+        self._last_runtime_folded_home_grad_dtypes: list[torch.dtype] = []
 
         self.router = self.submodules.router(
             config=self.config,
@@ -108,11 +153,80 @@ class BalancedMoELayer(BaseMoELayer):
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
-        if hasattr(self.experts, "disable_runtime_weight_main_grad_accumulation"):
+        self._runtime_weight_main_grad_accumulation = False
+        if hasattr(self.experts, "enable_runtime_weight_main_grad_accumulation"):
+            self.experts.enable_runtime_weight_main_grad_accumulation()
+            self._runtime_weight_main_grad_accumulation = True
+        elif hasattr(self.experts, "disable_runtime_weight_main_grad_accumulation"):
             self.experts.disable_runtime_weight_main_grad_accumulation()
         self.experts.free_expert_parameters(self.local_spare_expert_indices)
 
         self.expert_weight_dispatcher = self._make_expert_weight_dispatcher()
+
+        if self.use_shared_expert:
+            assert (
+                self.submodules.shared_experts is not None
+            ), "Shared experts builder is not provided in the module spec."
+            shared_expert_kwargs = {
+                "config": self.config,
+                "pg_collection": pg_collection,
+                "gate": self.config.moe_shared_expert_gate,
+            }
+            if self._builder_accepts_name(self.submodules.shared_experts):
+                shared_expert_kwargs["name"] = (
+                    name + ".shared_experts" if name is not None else None
+                )
+            self.shared_experts = self.submodules.shared_experts(**shared_expert_kwargs)
+
+    def _init_moonep(
+        self,
+        name: str | None,
+        pg_collection: ProcessGroupCollection,
+    ) -> None:
+        """Initialize checkpoint-owned experts and the MoonEP execution data plane."""
+
+        from megatron.core.transformer.moe.moonep_backend import MoonEPBalancedDataPlane
+
+        self.num_spare_experts = 0
+        self.num_local_home_experts = self.num_home_experts // self.ep_size
+        self.num_local_spare_experts = 0
+        self.num_local_total_experts = self.num_local_home_experts
+        self.num_total_experts = self.num_home_experts
+        self.local_home_expert_indices = list(range(self.num_local_home_experts))
+        self.local_spare_expert_indices = []
+        self.local_expert_indices = [
+            self.ep_rank * self.num_local_home_experts + i
+            for i in range(self.num_local_home_experts)
+        ]
+        self.num_local_experts = self.num_local_home_experts
+        self.last_debug_stats = None
+        self._last_runtime_spare_main_grad_dtypes = []
+        self._last_runtime_spare_main_grad_abs_sums = []
+        self._last_runtime_folded_home_grad_dtypes = []
+        self.is_first_microbatch = True
+
+        self.router = self.submodules.router(
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=self.is_mtp_layer,
+            layer_number=self.layer_number,
+        )
+        self.experts = self.submodules.experts(
+            self.num_local_home_experts,
+            self.config,
+            pg_collection=pg_collection,
+            name=(name + ".experts") if name is not None else None,
+        )
+        self.token_dispatcher = None
+        self.expert_weight_dispatcher = None
+        self.moonep_data_plane = MoonEPBalancedDataPlane(
+            self.experts,
+            self.config,
+            self.ep_group,
+            self.ep_rank,
+            self.ep_size,
+            self.num_home_experts,
+        )
 
         if self.use_shared_expert:
             assert (
@@ -171,7 +285,51 @@ class BalancedMoELayer(BaseMoELayer):
     def _validate_config(config: TransformerConfig) -> None:
         if not getattr(config, "moe_use_balanced_layer", False):
             return
-        if getattr(config, "moe_balance_expert_weight_dispatch_backend", "all_to_all") not in (
+        balance_backend = getattr(config, "moe_balance_backend", "legacy")
+        if balance_backend == "moonep":
+            if config.num_moe_experts is None:
+                raise ValueError("MoonEP BalancedMoELayer requires num_moe_experts.")
+            if config.expert_model_parallel_size <= 1:
+                raise ValueError("MoonEP BalancedMoELayer requires EP > 1.")
+            if config.num_moe_experts % config.expert_model_parallel_size != 0:
+                raise ValueError("MoonEP requires num_moe_experts divisible by EP.")
+            if not config.bf16 or config.fp16:
+                raise ValueError("MoonEP requires BF16 precision.")
+            if config.moe_router_dtype != "fp32":
+                raise ValueError("MoonEP requires moe_router_dtype='fp32'.")
+            if not config.moe_grouped_gemm:
+                raise ValueError("MoonEP requires TEGroupedMLP.")
+            if config.add_bias_linear:
+                raise ValueError("MoonEP does not support expert bias.")
+            if getattr(config, "moe_num_spare_experts", None) is not None:
+                raise ValueError("moe_num_spare_experts is legacy-only under MoonEP.")
+            if getattr(config, "moe_balance_recompute_expert_dispatch", False):
+                raise ValueError("MoonEP does not support expert-dispatch recompute.")
+            if config.moe_expert_capacity_factor is not None or config.moe_token_dropping:
+                raise ValueError("MoonEP does not support token dropping.")
+            if config.moe_shared_expert_overlap:
+                raise ValueError("MoonEP only supports non-overlap shared experts.")
+            if config.cuda_graph_impl != "none":
+                raise ValueError("MoonEP does not support CUDA Graph.")
+            if config.fp8 is not None or config.fp4 is not None:
+                raise ValueError("MoonEP does not support FP8 or FP4.")
+            if config.expert_tensor_parallel_size != 1:
+                raise ValueError("MoonEP does not support expert tensor parallelism.")
+            if config.pipeline_model_parallel_size != 1:
+                raise ValueError("MoonEP first version requires PP1.")
+            if config.tensor_model_parallel_size != 1:
+                raise ValueError("MoonEP first version requires TP1.")
+            return
+        if balance_backend != "legacy":
+            raise ValueError("moe_balance_backend must be 'legacy' or 'moonep'.")
+
+        expert_weight_backend = getattr(
+            config, "moe_balance_expert_weight_dispatch_backend", "all_to_all"
+        )
+        grad_combine_dtype = getattr(
+            config, "moe_balance_expert_weight_grad_combine_dtype", "fp32"
+        )
+        if expert_weight_backend not in (
             "all_to_all",
             "symmetric_memory",
             "hybridep",
@@ -179,6 +337,35 @@ class BalancedMoELayer(BaseMoELayer):
             raise ValueError(
                 "BalancedMoELayer requires moe_balance_expert_weight_dispatch_backend "
                 "to be 'all_to_all', 'symmetric_memory', or 'hybridep'."
+            )
+        if grad_combine_dtype not in (
+            "fp32",
+            "param_dtype",
+            "bf16",
+            "fp16",
+        ):
+            raise ValueError(
+                "BalancedMoELayer requires moe_balance_expert_weight_grad_combine_dtype "
+                "to be 'fp32', 'param_dtype', 'bf16', or 'fp16'."
+            )
+        if expert_weight_backend == "hybridep":
+            if grad_combine_dtype != "param_dtype":
+                raise ValueError(
+                    "BalancedMoELayer HybridEP expert-weight dispatch currently requires "
+                    "moe_balance_expert_weight_grad_combine_dtype='param_dtype' because "
+                    "HybridEP combines gradients in the parameter dtype."
+                )
+            if config.moe_grouped_gemm:
+                raise ValueError(
+                    "BalancedMoELayer HybridEP expert-weight dispatch does not yet support "
+                    "TEGroupedMLP runtime main_grad foldback."
+                )
+        if config.moe_grouped_gemm and getattr(
+            config, "moe_balance_recompute_expert_dispatch", False
+        ):
+            raise ValueError(
+                "BalancedMoELayer does not support recompute_expert_dispatch with "
+                "TEGroupedMLP runtime main_grad foldback."
             )
         if config.num_moe_experts is None:
             raise ValueError("BalancedMoELayer requires num_moe_experts.")
@@ -304,30 +491,118 @@ class BalancedMoELayer(BaseMoELayer):
 
     def _install_spare_expert_weights(
         self, expert_offloading_map: torch.Tensor
-    ) -> list[tensor_parallel.CheckpointWithoutOutput]:
+    ) -> tuple[list[tensor_parallel.CheckpointWithoutOutput], list[_RuntimeMainGradFoldbackContext]]:
         metadata = self.expert_weight_dispatcher.preprocess(expert_offloading_map)
         checkpoints: list[tensor_parallel.CheckpointWithoutOutput] = []
+        foldback_contexts: list[_RuntimeMainGradFoldbackContext] = []
         recompute_dispatch = getattr(self.config, "moe_balance_recompute_expert_dispatch", False)
+        backend = getattr(self.config, "moe_balance_expert_weight_dispatch_backend", "all_to_all")
         for module in ("fc1", "fc2"):
             home_weights = self.experts.get_expert_weights(module, self.local_home_expert_indices)
+            forward_dtype = home_weights[0].dtype
+            runtime_weight_dtype = (
+                forward_dtype
+                if self._runtime_weight_main_grad_accumulation
+                else _runtime_weight_grad_edge_dtype(
+                    forward_dtype,
+                    getattr(self.config, "moe_balance_expert_weight_grad_combine_dtype", "fp32"),
+                )
+                if backend in ("all_to_all", "symmetric_memory")
+                else forward_dtype
+            )
             if recompute_dispatch:
                 checkpoint = tensor_parallel.CheckpointWithoutOutput()
                 spare_weights = list(
                     checkpoint.checkpoint(
-                        partial(self._dispatch_spare_expert_weights_for_checkpoint, metadata),
+                        partial(
+                            self._dispatch_spare_expert_weights_for_checkpoint,
+                            metadata,
+                            runtime_weight_dtype,
+                        ),
                         *home_weights,
                     )
                 )
                 checkpoints.append(checkpoint)
             else:
-                spare_weights = self.expert_weight_dispatcher.dispatch(metadata, *home_weights)
+                spare_weights = self.expert_weight_dispatcher.dispatch(
+                    metadata, *home_weights, runtime_weight_dtype=runtime_weight_dtype
+                )
+            if not self._runtime_weight_main_grad_accumulation:
+                spare_weights = _cast_runtime_expert_weights_for_forward(spare_weights, forward_dtype)
             self.experts.set_expert_weights(module, spare_weights, self.local_spare_expert_indices)
-        return checkpoints
+            if self._runtime_weight_main_grad_accumulation:
+                attached_spare_weights = self.experts.get_expert_weights(
+                    module, self.local_spare_expert_indices
+                )
+                foldback_contexts.append(
+                    _RuntimeMainGradFoldbackContext(
+                        module=module,
+                        metadata=metadata,
+                        home_weights=home_weights,
+                        spare_weights=attached_spare_weights,
+                    )
+                )
+        return checkpoints, foldback_contexts
 
     def _dispatch_spare_expert_weights_for_checkpoint(
-        self, metadata, *home_weights: torch.Tensor
+        self, metadata, runtime_weight_dtype: torch.dtype, *home_weights: torch.Tensor
     ) -> tuple[torch.Tensor, ...]:
-        return tuple(self.expert_weight_dispatcher.dispatch(metadata, *home_weights))
+        return tuple(
+            self.expert_weight_dispatcher.dispatch(
+                metadata, *home_weights, runtime_weight_dtype=runtime_weight_dtype
+            )
+        )
+
+    @staticmethod
+    def _ensure_main_grad(
+        weight: torch.Tensor, grad: torch.Tensor, *, preferred_dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        dtype = preferred_dtype or grad.dtype
+        if (
+            not hasattr(weight, "main_grad")
+            or weight.main_grad is None
+            or weight.main_grad.shape != weight.shape
+            or weight.main_grad.device != weight.device
+            or weight.main_grad.dtype != dtype
+        ):
+            weight.main_grad = torch.zeros_like(weight, dtype=dtype)
+        return weight.main_grad
+
+    def _fold_runtime_main_grads(
+        self, contexts: list[_RuntimeMainGradFoldbackContext], grad_input: torch.Tensor
+    ) -> torch.Tensor:
+        self._last_runtime_spare_main_grad_dtypes = []
+        self._last_runtime_spare_main_grad_abs_sums = []
+        self._last_runtime_folded_home_grad_dtypes = []
+        for context in contexts:
+            spare_grads = []
+            for spare_weight in context.spare_weights:
+                main_grad = getattr(spare_weight, "main_grad", None)
+                if main_grad is None:
+                    raise RuntimeError(
+                        "BalancedMoELayer expected TE runtime spare weight main_grad "
+                        f"for {context.module}."
+                    )
+                self._last_runtime_spare_main_grad_dtypes.append(main_grad.dtype)
+                self._last_runtime_spare_main_grad_abs_sums.append(
+                    float(main_grad.detach().abs().sum().item())
+                )
+                spare_grads.append(main_grad)
+            local_home_grads = self.expert_weight_dispatcher.fold_spare_gradients(
+                context.metadata,
+                *spare_grads,
+                reference_weight_dtype=context.home_weights[0].dtype,
+            )
+            for home_weight, home_grad in zip(context.home_weights, local_home_grads):
+                self._last_runtime_folded_home_grad_dtypes.append(home_grad.dtype)
+                main_grad = self._ensure_main_grad(
+                    home_weight, home_grad, preferred_dtype=torch.float32
+                )
+                main_grad.add_(home_grad.to(dtype=main_grad.dtype))
+            for spare_weight in context.spare_weights:
+                spare_weight.main_grad.zero_()
+                spare_weight.grad_added_to_main_grad = False
+        return grad_input
 
     def _effective_spare_columns(self) -> list[int]:
         columns = []
@@ -425,6 +700,18 @@ class BalancedMoELayer(BaseMoELayer):
 
         shared_expert_output = self._shared_experts_compute(hidden_states)
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, input_ids)
+        if self.balance_backend == "moonep":
+            output, _plan = self.moonep_data_plane.forward(
+                hidden_states,
+                probs,
+                routing_map,
+                refresh_shadow=self.is_first_microbatch,
+            )
+            self.is_first_microbatch = False
+            if shared_expert_output is not None:
+                output = output + shared_expert_output
+            return output, None
+
         tokens_per_expert_from_ep_rank = self._gather_tokens_per_home_expert(routing_map)
         rerouting_map, rerouted_probs, expert_offloading_map = self._make_plan(
             routing_map, probs, tokens_per_expert_from_ep_rank
@@ -435,7 +722,9 @@ class BalancedMoELayer(BaseMoELayer):
         self._maybe_record_debug_stats(
             tokens_per_expert_from_ep_rank, rerouting_map, expert_offloading_map
         )
-        expert_dispatch_checkpoints = self._install_spare_expert_weights(expert_offloading_map)
+        expert_dispatch_checkpoints, runtime_main_grad_contexts = self._install_spare_expert_weights(
+            expert_offloading_map
+        )
 
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, rerouting_map, rerouted_probs
@@ -445,6 +734,10 @@ class BalancedMoELayer(BaseMoELayer):
             self.token_dispatcher.dispatch_postprocess(dispatched_input, probs)
         )
         self._assert_inactive_spares_receive_no_tokens(tokens_per_expert, expert_offloading_map)
+        if runtime_main_grad_contexts and dispatched_input.requires_grad:
+            dispatched_input.register_hook(
+                partial(self._fold_runtime_main_grads, runtime_main_grad_contexts)
+            )
         expert_output, mlp_bias = apply_module(self.experts)(
             dispatched_input, tokens_per_expert, permuted_probs
         )

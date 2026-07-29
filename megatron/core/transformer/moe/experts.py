@@ -315,6 +315,7 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size
             )
+        self._runtime_weight_main_grad_accumulation = False
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
@@ -982,6 +983,42 @@ class TEGroupedMLP(MegatronModule):
         for expert_layer in (self.linear_fc1, self.linear_fc2):
             if hasattr(expert_layer, "fuse_wgrad_accumulation"):
                 expert_layer.fuse_wgrad_accumulation = False
+        self._runtime_weight_main_grad_accumulation = False
+
+    @staticmethod
+    def _ensure_fp32_main_grad(weight: torch.Tensor, *, zero: bool) -> None:
+        if (
+            not hasattr(weight, "main_grad")
+            or weight.main_grad is None
+            or weight.main_grad.shape != weight.shape
+            or weight.main_grad.device != weight.device
+            or weight.main_grad.dtype != torch.float32
+        ):
+            weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+        elif zero:
+            weight.main_grad.zero_()
+        if not hasattr(weight, "grad_added_to_main_grad"):
+            weight.grad_added_to_main_grad = False
+
+    def enable_runtime_weight_main_grad_accumulation(self) -> None:
+        """Use TE GroupedLinear wgrad kernels to write runtime spare gradients to FP32 main_grad."""
+
+        for expert_layer in (self.linear_fc1, self.linear_fc2):
+            if not hasattr(expert_layer, "fuse_wgrad_accumulation"):
+                raise RuntimeError(
+                    "BalancedMoELayer TE runtime wgrad requires GroupedLinear "
+                    "fuse_wgrad_accumulation support."
+                )
+            expert_layer.fuse_wgrad_accumulation = True
+            self._assert_per_expert_grouped_weights(expert_layer)
+            for expert_index in range(self.num_local_experts):
+                weight = getattr(expert_layer, f"weight{expert_index}", None)
+                if weight is not None:
+                    self._ensure_fp32_main_grad(weight, zero=False)
+        self._runtime_weight_main_grad_accumulation = True
+
+    def uses_runtime_weight_main_grad_accumulation(self) -> bool:
+        return self._runtime_weight_main_grad_accumulation
 
     def get_expert_weights(self, module: str, expert_indices: list[int]) -> list[torch.Tensor]:
         """Return the selected local expert weights for an fc1/fc2 module."""
@@ -1009,6 +1046,9 @@ class TEGroupedMLP(MegatronModule):
                     f"Expected {module} expert weight shape {tuple(expected_shape)}, "
                     f"got {tuple(expert_weight.shape)}."
                 )
+            if self._runtime_weight_main_grad_accumulation:
+                expert_weight = expert_weight.detach().requires_grad_(True)
+                self._ensure_fp32_main_grad(expert_weight, zero=True)
             name = f"weight{expert_index}"
             if name in expert_layer._parameters:
                 delattr(expert_layer, name)

@@ -8,6 +8,7 @@ spillover tokens to spare expert slots, and returns an effective home-plus-spare
 routing view expected by ``MoEAlltoAllTokenDispatcher``.
 """
 
+import math
 import os
 from typing import Literal, Union
 
@@ -23,6 +24,10 @@ def _validate_common_inputs(
     num_ep_ranks: int,
     num_spare_experts_per_ep_rank: int,
 ) -> None:
+    if num_ep_ranks <= 0:
+        raise ValueError("offloading_planner requires a positive num_ep_ranks.")
+    if map_token_to_expert.ndim != 2:
+        raise ValueError("offloading_planner expects a 2D routing map [tokens, experts].")
     if map_token_to_expert.dtype is not torch.bool:
         raise ValueError("offloading_planner expects map_token_to_expert to be a bool tensor.")
     if map_token_to_expert.shape != probs_routing.shape:
@@ -30,8 +35,23 @@ def _validate_common_inputs(
             "offloading_planner expects map_token_to_expert and probs_routing "
             f"to have the same shape, got {map_token_to_expert.shape} and {probs_routing.shape}."
         )
+    if not torch.is_floating_point(probs_routing):
+        raise ValueError("offloading_planner expects probs_routing to be floating-point.")
+    if probs_routing.device != map_token_to_expert.device:
+        raise ValueError(
+            "offloading_planner expects routing and probability tensors on one device."
+        )
     if count_tokens_per_expert_from_ep_rank.ndim != 2:
         raise ValueError("offloading_planner expects token counts shaped [ep, num_experts].")
+    if count_tokens_per_expert_from_ep_rank.dtype not in (torch.int32, torch.int64):
+        raise ValueError("offloading_planner expects integer token counts.")
+    if count_tokens_per_expert_from_ep_rank.device != map_token_to_expert.device:
+        raise ValueError("offloading_planner expects routing and token counts on one device.")
+    if (
+        not torch.compiler.is_compiling()
+        and (count_tokens_per_expert_from_ep_rank < 0).any().item()
+    ):
+        raise ValueError("offloading_planner expects non-negative token counts.")
     if count_tokens_per_expert_from_ep_rank.shape[0] != num_ep_ranks:
         raise ValueError(
             "offloading_planner count tensor EP dimension does not match num_ep_ranks: "
@@ -46,6 +66,27 @@ def _validate_common_inputs(
         raise ValueError("offloading_planner requires num_experts divisible by num_ep_ranks.")
     if num_spare_experts_per_ep_rank <= 0:
         raise ValueError("offloading_planner requires a positive spare expert count per EP rank.")
+
+
+def _validate_planner_options(
+    ep_rank: Union[torch.Tensor, int],
+    num_ep_ranks: int,
+    threshold_multiplier: float,
+) -> int:
+    rank = _ep_rank_to_int(ep_rank)
+    if rank < 0 or rank >= num_ep_ranks:
+        raise ValueError(
+            f"offloading_planner ep_rank must be in [0, {num_ep_ranks}), got {rank}."
+        )
+    try:
+        threshold = float(threshold_multiplier)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("offloading_planner expects a finite threshold multiplier.") from exc
+    if not math.isfinite(threshold):
+        raise ValueError("offloading_planner expects a finite threshold multiplier.")
+    if threshold < 0:
+        raise ValueError("offloading_planner expects a non-negative threshold multiplier.")
+    return rank
 
 
 def _ep_rank_to_int(ep_rank: Union[torch.Tensor, int]) -> int:
@@ -318,6 +359,7 @@ def gen_assignment_for_approx_bp(
     num_ep_ranks: int,
     dtype_index: torch.dtype = torch.int32,
     num_buckets: int = 8,
+    threshold_multiplier: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate home-expert to spare-rank assignment for approx bin packing."""
 
@@ -327,7 +369,7 @@ def gen_assignment_for_approx_bp(
             ep_rank,
             num_ep_ranks,
             num_spare_experts_per_ep_rank=1,
-            threshold_multiplier=0.0,
+            threshold_multiplier=threshold_multiplier,
             dtype_index=dtype_index,
         )
     )
@@ -351,6 +393,17 @@ def gen_assignment_for_approx_bp(
     count_tokens_from_chunk_to_bucket = count_tokens_from_chunk_to_bucket_sorted[
         inverse_spillover_perm
     ][:, inverse_spare_perm]
+    if threshold_multiplier > 0:
+        count_tokens_per_expert = count_tokens_per_expert_from_ep_rank.sum(dim=0).to(
+            dtype_index
+        )
+        count_tokens_per_ep_rank = count_tokens_per_expert.view(num_ep_ranks, -1).sum(dim=1)
+        count_tokens_from_chunk_to_bucket = reclaim_spare_experts(
+            count_tokens_per_ep_rank,
+            avg_tokens_per_ep_rank,
+            count_tokens_from_chunk_to_bucket,
+            threshold_multiplier,
+        )
 
     return (
         count_tokens_from_chunk_to_bucket.to(dtype_index),
@@ -500,6 +553,7 @@ def gen_offloading_plan_eager(
         num_ep_ranks,
         num_spare_experts_per_ep_rank,
     )
+    rank = _validate_planner_options(ep_rank, num_ep_ranks, threshold_multiplier)
 
     if assignment_algorithm == "one_shot_greedy":
         count_tokens_from_home_expert_to_spare_expert, _, _ = gen_assignment(
@@ -517,7 +571,11 @@ def gen_offloading_plan_eager(
                 f"got {num_spare_experts_per_ep_rank}"
             )
         count_tokens_from_home_expert_to_spare_expert, _, _ = gen_assignment_for_approx_bp(
-            count_tokens_per_expert_from_ep_rank, ep_rank, num_ep_ranks, dtype_index
+            count_tokens_per_expert_from_ep_rank,
+            ep_rank,
+            num_ep_ranks,
+            dtype_index,
+            threshold_multiplier=threshold_multiplier,
         )
     else:
         raise ValueError(
@@ -542,7 +600,6 @@ def gen_offloading_plan_eager(
     count_tokens_offloaded_from_home = (
         count_tokens_per_expert_from_ep_rank - count_tokens_after_second_offload
     )
-    rank = _ep_rank_to_int(ep_rank)
     rerouting_home_first, rerouted_probs_home_first = reroute_tokens_eager(
         map_token_to_expert,
         probs_routing,
@@ -590,6 +647,17 @@ def gen_offloading_plan(
     contract. Set ``MEGATRON_BALANCED_MOE_PLANNER_EAGER=1`` to force the eager
     fallback during local debugging.
     """
+
+    # Keep value-dependent validation outside the compiled graph. The eager
+    # entrypoint repeats it for direct callers and debug use.
+    _validate_common_inputs(
+        map_token_to_expert,
+        probs_routing,
+        count_tokens_per_expert_from_ep_rank,
+        num_ep_ranks,
+        num_spare_experts_per_ep_rank,
+    )
+    _validate_planner_options(ep_rank, num_ep_ranks, threshold_multiplier)
 
     if os.getenv("MEGATRON_BALANCED_MOE_PLANNER_EAGER") != "1":
         try:
@@ -661,7 +729,7 @@ def gen_random_offloading_plan(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate a deterministic random offloading plan for debug and tests."""
 
-    del tokens_per_expert_from_ep_rank, ep_rank, threshold_multiplier, index_dtype
+    del tokens_per_expert_from_ep_rank, index_dtype
     _validate_common_inputs(
         routing_map,
         probs,
@@ -669,6 +737,7 @@ def gen_random_offloading_plan(
         ep,
         spare_expert_per_ep_rank,
     )
+    _validate_planner_options(ep_rank, ep, threshold_multiplier)
 
     global rank_random_generator
     device = routing_map.device
