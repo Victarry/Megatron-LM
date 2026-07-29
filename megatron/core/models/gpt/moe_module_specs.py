@@ -1,5 +1,6 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 from functools import partial
 from typing import Optional
 
@@ -10,10 +11,39 @@ from megatron.core.models.backends import (
     LocalSpecProvider,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.balanced_moe_layer import BalancedMoELayer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MlpBuilder
+
+
+def build_moe_layer(
+    config: TransformerConfig,
+    submodules: MoESubmodules,
+    layer_number: int | None = None,
+    pg_collection=None,
+    is_mtp_layer: bool = False,
+    name: str | None = None,
+):
+    """Build the configured MoE layer implementation."""
+
+    layer_cls = BalancedMoELayer if getattr(config, "moe_use_balanced_layer", False) else MoELayer
+    layer_kwargs = {
+        "config": config,
+        "submodules": submodules,
+        "layer_number": layer_number,
+        "pg_collection": pg_collection,
+        "is_mtp_layer": is_mtp_layer,
+    }
+    try:
+        accepts_name = "name" in inspect.signature(layer_cls).parameters
+    except (TypeError, ValueError):
+        accepts_name = True
+    if accepts_name:
+        layer_kwargs["name"] = name
+    return layer_cls(**layer_kwargs)
 
 
 def get_moe_module_spec(
@@ -63,7 +93,7 @@ def get_moe_module_spec_for_backend(
 
     # MoE module spec
     return partial(
-        MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
+        build_moe_layer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
     )
 
 

@@ -422,7 +422,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 8: MLP block]
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TEFusedMLP
-        from megatron.core.transformer.moe.moe_layer import MoELayer
+        from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
@@ -463,7 +463,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
 
-        self.is_moe_layer = isinstance(self.mlp, MoELayer)
+        self.is_moe_layer = isinstance(self.mlp, BaseMoELayer)
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -524,7 +524,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 ):
                     self.recompute_pre_mlp_layernorm = True
                     if self.config.fp8 or self.config.fp4:
-                        if isinstance(self.mlp, MoELayer):
+                        if isinstance(self.mlp, BaseMoELayer):
                             self.mlp.set_for_recompute_pre_mlp_layernorm()
                         else:
                             from megatron.core.extensions.transformer_engine import (

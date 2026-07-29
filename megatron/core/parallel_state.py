@@ -2106,6 +2106,15 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # MoonEP VMM mappings use EP-group barriers during teardown and therefore
+    # must be released before this function clears the process groups.
+    try:
+        from megatron.core.transformer.moe.moonep_backend import close_moonep_runtimes
+
+        close_moonep_runtimes()
+    except ImportError:
+        pass
+
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
 

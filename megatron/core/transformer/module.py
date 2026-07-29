@@ -111,6 +111,10 @@ class MegatronModule(torch.nn.Module):
             self.config.fp8 is not None
             or self.config.fp4 is not None
             or getattr(self.config, 'use_kitchen', False)
+            or (
+                getattr(self.config, 'moe_use_balanced_layer', False)
+                and getattr(self.config, 'moe_balance_backend', 'legacy') == 'moonep'
+            )
         ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
