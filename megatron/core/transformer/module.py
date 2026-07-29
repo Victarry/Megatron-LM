@@ -113,6 +113,7 @@ class MegatronModule(torch.nn.Module):
             or self.config.fp4 is not None
             or getattr(self.config, 'use_kitchen', False)
             or getattr(self.config, 'quant_recipe', None) is not None
+            or getattr(self.config, 'moe_use_balanced_layer', False)
         ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []

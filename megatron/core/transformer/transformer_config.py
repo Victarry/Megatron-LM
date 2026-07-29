@@ -908,6 +908,21 @@ class TransformerConfig(ModelParallelConfig):
     parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
     and ``add_bias_linear=True``."""
 
+    moe_use_balanced_layer: bool = False
+    """Replace the standard MoE data plane with the MoonEP-backed BalancedMoELayer."""
+
+    moe_balance_moonep_num_sms: Optional[int] = None
+    """Number of SMs used by MoonEP communication kernels; None uses the backend default."""
+
+    moe_balance_moonep_token_padding: int = 128
+    """Per-VM-group token alignment used by MoonEP."""
+
+    moe_balance_moonep_comm_stream_priority: int = -1
+    """Priority of the MoonEP communication stream."""
+
+    moe_balance_moonep_enable_pdl: bool = True
+    """Enable MoonEP programmatic dependent launch."""
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -1975,6 +1990,61 @@ class TransformerConfig(ModelParallelConfig):
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
+
+        if self.moe_use_balanced_layer:
+            if self.num_moe_experts is None:
+                raise ValueError("BalancedMoELayer requires num_moe_experts.")
+            if self.expert_model_parallel_size <= 1:
+                raise ValueError("BalancedMoELayer requires expert_model_parallel_size > 1.")
+            if self.num_moe_experts % self.expert_model_parallel_size != 0:
+                raise ValueError("BalancedMoELayer requires num_moe_experts divisible by EP.")
+            if not self.bf16 or self.fp16:
+                raise ValueError("BalancedMoELayer requires BF16 precision.")
+            if self.moe_router_dtype != "fp32":
+                raise ValueError("BalancedMoELayer requires moe_router_dtype='fp32'.")
+            if not self.moe_grouped_gemm:
+                raise ValueError("BalancedMoELayer requires TEGroupedMLP.")
+            if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+                raise ValueError("BalancedMoELayer requires per-expert grouped weights.")
+            if self.add_bias_linear:
+                raise ValueError("BalancedMoELayer does not support expert bias.")
+            if self.cuda_graph_impl != "none":
+                raise ValueError("BalancedMoELayer does not support CUDA Graph.")
+            if self.fp8 is not None or self.fp4 is not None:
+                raise ValueError("BalancedMoELayer does not support FP8 or FP4.")
+            if self.moe_router_padding_for_fp8 or self.moe_router_padding_for_quantization:
+                raise ValueError("BalancedMoELayer does not support quantization router padding.")
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError("BalancedMoELayer does not support inference_optimized.")
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError("BalancedMoELayer requires expert_tensor_parallel_size=1.")
+            if self.tensor_model_parallel_size != 1:
+                raise ValueError("BalancedMoELayer requires tensor_model_parallel_size=1.")
+            if self.pipeline_model_parallel_size != 1:
+                raise ValueError("BalancedMoELayer requires pipeline_model_parallel_size=1.")
+            if self.moe_latent_size is not None:
+                raise ValueError("BalancedMoELayer does not support latent MoE.")
+            if self.moe_paged_stash:
+                raise ValueError("BalancedMoELayer does not support paged stashing.")
+            if self.moe_shared_expert_overlap:
+                raise ValueError("BalancedMoELayer does not support shared-expert overlap.")
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError("BalancedMoELayer does not support EP overlap.")
+            if self.delay_wgrad_compute or self.overlap_dispatch_backward_with_experts_wgrad:
+                raise ValueError("BalancedMoELayer does not support delayed or overlapped wgrad.")
+            if self.moe_expert_capacity_factor is not None or self.moe_token_dropping:
+                raise ValueError("BalancedMoELayer does not support token dropping.")
+            if self.cpu_offloading:
+                raise ValueError("BalancedMoELayer does not support CPU offload.")
+            if self.recompute_granularity == "full" or (
+                self.recompute_granularity == "selective"
+                and "moe" in (self.recompute_modules or [])
+            ):
+                raise ValueError("BalancedMoELayer does not support MoE recompute.")
+            if self.moe_balance_moonep_num_sms is not None and self.moe_balance_moonep_num_sms <= 0:
+                raise ValueError("moe_balance_moonep_num_sms must be positive.")
+            if self.moe_balance_moonep_token_padding <= 0:
+                raise ValueError("moe_balance_moonep_token_padding must be positive.")
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
