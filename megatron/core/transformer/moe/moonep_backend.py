@@ -47,15 +47,21 @@ class _DenseRouteToMoonEP(torch.autograd.Function):
                 "MoonEP route adapter requires probs and routing_map with matching [S, E] shapes"
             )
         if probs.dtype != torch.float32:
-            raise ValueError(f"MoonEP route probabilities must be FP32, got {probs.dtype}")
+            raise ValueError(
+                f"MoonEP route probabilities must be FP32, got {probs.dtype}"
+            )
         if routing_map.dtype != torch.bool:
-            raise ValueError(f"MoonEP routing_map must be bool, got {routing_map.dtype}")
+            raise ValueError(
+                f"MoonEP routing_map must be bool, got {routing_map.dtype}"
+            )
         if not 1 <= topk <= probs.shape[1]:
             raise ValueError(f"MoonEP topk must be in [1, E], got {topk}")
 
         route_counts = routing_map.sum(dim=-1)
         if torch.any(route_counts > topk):
-            raise ValueError("MoonEP routing_map contains more than topk routes for a token")
+            raise ValueError(
+                "MoonEP routing_map contains more than topk routes for a token"
+            )
 
         num_tokens, num_experts = probs.shape
         expert_range = torch.arange(num_experts, device=probs.device, dtype=torch.int64)
@@ -66,11 +72,15 @@ class _DenseRouteToMoonEP(torch.autograd.Function):
 
         # Padding tokens have no valid route. Fill those physical slots evenly so
         # they do not manufacture a planner hotspot; their route weights stay zero.
-        token_ids = torch.arange(num_tokens, device=probs.device, dtype=torch.int64)[:, None]
+        token_ids = torch.arange(num_tokens, device=probs.device, dtype=torch.int64)[
+            :, None
+        ]
         slot_ids = torch.arange(topk, device=probs.device, dtype=torch.int64)[None, :]
         padding_ids = (token_ids * topk + slot_ids) % num_experts
         expert_ids = torch.where(valid, expert_ids, padding_ids)
-        route_weights = probs.gather(1, expert_ids).masked_fill(~valid, 0.0).contiguous()
+        route_weights = (
+            probs.gather(1, expert_ids).masked_fill(~valid, 0.0).contiguous()
+        )
         expert_ids_i32 = expert_ids.to(torch.int32).contiguous()
         tokens_per_expert = torch.bincount(
             expert_ids.reshape(-1), minlength=num_experts
@@ -174,9 +184,7 @@ class MoonEPRuntime:
                     zero_copy=False,
                 )
             )
-            event = self.buffer.prefetch_weights(
-                plan, full_weights, async_finish=True
-            )
+            event = self.buffer.prefetch_weights(plan, full_weights, async_finish=True)
         self._wait(event)
         return dispatched_hidden, dispatched_weights, cu_seqlens, plan
 
@@ -307,7 +315,9 @@ class _MoonEPDispatchAutograd(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_hidden, grad_route_weights):
         if grad_hidden is None:
-            raise RuntimeError("MoonEP dispatch backward requires hidden-state gradients")
+            raise RuntimeError(
+                "MoonEP dispatch backward requires hidden-state gradients"
+            )
         grad_input, grad_probs = ctx.runtime.combine(
             ctx.plan, grad_hidden, grad_route_weights
         )
@@ -468,10 +478,13 @@ class MoonEPGroupedMLP:
         ops.append(fc1)
 
         activation_kwargs = {}
-        if "glu_interleave_size" in inspect.signature(
-            te.pytorch.ops.ScaledSwiGLU
-        ).parameters:
-            activation_kwargs["glu_interleave_size"] = self.config.moe_mlp_glu_interleave_size
+        if (
+            "glu_interleave_size"
+            in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
+        ):
+            activation_kwargs["glu_interleave_size"] = (
+                self.config.moe_mlp_glu_interleave_size
+            )
         ops.append(te.pytorch.ops.ScaledSwiGLU(**activation_kwargs))
 
         fc2 = te.pytorch.ops.GroupedLinear(
@@ -515,7 +528,13 @@ class MoonEPGroupedMLP:
         runtime: MoonEPRuntime,
         plan,
     ) -> torch.Tensor:
-        self.begin(plan)
+        track_weight_grads = torch.is_grad_enabled()
+        if track_weight_grads:
+            self.begin(plan)
+        elif self._active_plan is not None:
+            raise RuntimeError(
+                "MoonEP cannot start a forward-only pass while a training plan is active"
+            )
         zero = torch.zeros(1, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
         tokens_per_group = torch.diff(torch.cat((zero, cu_seqlens))).contiguous()
         tail_rows = dispatched_hidden.shape[0] - cu_seqlens[-1]
@@ -524,9 +543,12 @@ class MoonEPGroupedMLP:
             torch.arange(dispatched_hidden.shape[0], device=dispatched_hidden.device)
             < cu_seqlens[-1]
         )
-        guarded_hidden = _MoonEPWeightGradBarrier.apply(
-            dispatched_hidden, self, runtime, plan, *self.home_parameters
-        )
+        if track_weight_grads:
+            guarded_hidden = _MoonEPWeightGradBarrier.apply(
+                dispatched_hidden, self, runtime, plan, *self.home_parameters
+            )
+        else:
+            guarded_hidden = dispatched_hidden
         guarded_hidden = guarded_hidden * valid_rows.unsqueeze(-1)
         dispatched_probs = dispatched_probs * valid_rows
         return self.ops(
@@ -551,7 +573,9 @@ class MoonEPGroupedMLP:
                     or home_weight.main_grad is None
                     or home_weight.main_grad.dtype != torch.float32
                 ):
-                    home_weight.main_grad = torch.zeros_like(home_weight, dtype=torch.float32)
+                    home_weight.main_grad = torch.zeros_like(
+                        home_weight, dtype=torch.float32
+                    )
                 home_weight.main_grad.add_(shadow_grad)
                 home_weight.grad_added_to_main_grad = True
         self.table.clear_local_home_grads()
@@ -612,7 +636,14 @@ class MoonEPBalancedDataPlane:
             num_experts=self.num_experts,
             num_spare_experts=self.num_spare_experts,
         )
-        if refresh_shadow or self.grouped_mlp.table is None:
+        # Forward-only evaluation follows an optimizer step without necessarily
+        # receiving MCore's first-microbatch signal. Refreshing here guarantees
+        # that validation never observes the previous optimizer version.
+        if (
+            refresh_shadow
+            or self.grouped_mlp.table is None
+            or not torch.is_grad_enabled()
+        ):
             self.grouped_mlp.refresh_shadow()
 
         dispatched_hidden, dispatched_probs, cu_seqlens, plan = (
@@ -636,7 +667,5 @@ class MoonEPBalancedDataPlane:
             dispatched_hidden, dispatched_probs, cu_seqlens, runtime, plan
         )
         combined, _ = runtime.combine(plan, expert_output)
-        output = _MoonEPCombineAutograd.apply(
-            expert_output, combined, runtime, plan
-        )
+        output = _MoonEPCombineAutograd.apply(expert_output, combined, runtime, plan)
         return output.view(hidden_shape), plan

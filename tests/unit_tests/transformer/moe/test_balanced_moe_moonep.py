@@ -168,7 +168,9 @@ def _print_moonep_benchmark(phase, event_ms, wall_ms, local_payload_bytes):
 @pytest.mark.internal
 def test_moonep_route_adapter_dispatch_combine_forward_backward_parity():
     moonep = _require_moonep()
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, expert_model_parallel_size=4
+    )
     buffer = None
     try:
         group = get_default_pg_collection().ep
@@ -233,7 +235,9 @@ def test_moonep_route_adapter_dispatch_combine_forward_backward_parity():
             (torch.zeros(1, dtype=cu_seqlens.dtype, device=device), cu_seqlens[:-1])
         )
         scales = torch.ones(dispatched.shape[0], dtype=torch.bfloat16, device=device)
-        for group_index, (start, end) in enumerate(zip(starts.tolist(), cu_seqlens.tolist())):
+        for group_index, (start, end) in enumerate(
+            zip(starts.tolist(), cu_seqlens.tolist())
+        ):
             scales[start:end] = (int(group_experts[group_index]) + 1) / num_experts
         base = (dispatched * scales[:, None]).to(torch.bfloat16)
         expert_output = (base.float() * dispatched_weights[:, None]).to(torch.bfloat16)
@@ -282,7 +286,9 @@ def test_moonep_route_adapter_dispatch_combine_forward_backward_parity():
 @pytest.mark.internal
 def test_moonep_vmm_shadow_prefetch_and_fanout_fp32_grad_reduce():
     moonep = _require_moonep()
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, expert_model_parallel_size=4
+    )
     buffer = None
     table = None
     try:
@@ -371,7 +377,9 @@ def test_moonep_data_plane_latency_and_actual_payload_bandwidth(
 ):
     del case_name
     moonep = _require_moonep()
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, expert_model_parallel_size=4
+    )
     buffer = None
     table = None
     try:
@@ -409,7 +417,9 @@ def test_moonep_data_plane_latency_and_actual_payload_bandwidth(
             num_ep_ranks=world_size,
             group=group,
         )
-        hidden = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+        hidden = torch.randn(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        )
         weights = torch.ones(num_tokens, 1, dtype=torch.float32, device=device)
         ids = (
             torch.arange(num_tokens, dtype=torch.int32, device=device) % num_experts
@@ -467,9 +477,7 @@ def test_moonep_data_plane_latency_and_actual_payload_bandwidth(
         )
 
         def prefetch_phase():
-            event = buffer.prefetch_weights(
-                plan, table.full_weights, async_finish=True
-            )
+            event = buffer.prefetch_weights(plan, table.full_weights, async_finish=True)
             return None, event
 
         _, event_ms, wall_ms = _benchmark_phase(prefetch_phase)
@@ -554,14 +562,18 @@ def test_moonep_data_plane_latency_and_actual_payload_bandwidth(
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(not HAVE_TE, reason="MoonEP full-layer parity requires Transformer Engine.")
+@pytest.mark.skipif(
+    not HAVE_TE, reason="MoonEP full-layer parity requires Transformer Engine."
+)
 @pytest.mark.skipif(
     not is_te_min_version("2.14.0"),
     reason="MoonEPGroupedMLP requires Transformer Engine 2.14 or later.",
 )
 def test_balanced_moe_moonep_full_layer_parity_refresh_and_state_dict():
     _require_moonep()
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, expert_model_parallel_size=4
+    )
     try:
         num_experts = 32
         _set_random_seed(seed_=1234, data_parallel_random_init=False)
@@ -638,12 +650,42 @@ def test_balanced_moe_moonep_full_layer_parity_refresh_and_state_dict():
                     _grad(baseline_param).float(),
                 )
             for baseline_param, balanced_param in zip(
-                baseline.shared_experts.parameters(), balanced.shared_experts.parameters()
+                baseline.shared_experts.parameters(),
+                balanced.shared_experts.parameters(),
             ):
                 torch.testing.assert_close(
                     _grad(balanced_param),
                     _grad(baseline_param),
                 )
             assert baseline.state_dict().keys() == balanced.state_dict().keys()
+
+        # Evaluation can begin immediately after an optimizer update, before
+        # MCore emits another first-microbatch cache signal. It must refresh the
+        # shadow and support repeated forward-only batches without a backward.
+        for baseline_param, balanced_param in zip(
+            baseline.experts.parameters(), balanced.experts.parameters()
+        ):
+            baseline_param.data.add_(0.03125)
+            balanced_param.data.add_(0.03125)
+        assert not balanced.is_first_microbatch
+        baseline.eval()
+        balanced.eval()
+        generator = torch.Generator(device="cuda").manual_seed(10000)
+        eval_hidden = torch.randn(
+            8,
+            4,
+            512,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        padding_mask = torch.zeros(4, 8, dtype=torch.bool, device="cuda")
+        padding_mask[:, -1] = True
+        with torch.no_grad():
+            for _ in range(2):
+                baseline_output, _ = baseline(eval_hidden, padding_mask=padding_mask)
+                balanced_output, _ = balanced(eval_hidden, padding_mask=padding_mask)
+                torch.testing.assert_close(balanced_output, baseline_output)
+                assert balanced.moonep_data_plane.grouped_mlp._active_plan is None
     finally:
         Utils.destroy_model_parallel()
