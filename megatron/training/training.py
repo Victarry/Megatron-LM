@@ -1921,6 +1921,14 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
+    if args.moe_enable_ultraep:
+        # UltraEP's load profiler owns a ThreadPoolExecutor. Flush it while the
+        # executor and CUDA context are still alive; Python's generic atexit
+        # phase runs after the thread-pool shutdown hook and is too late.
+        from megatron.core.transformer.moe.ultraep_manager import destroy_ultraep_managers
+
+        destroy_ultraep_managers()
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 

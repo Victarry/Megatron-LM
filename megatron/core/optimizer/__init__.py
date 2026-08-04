@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import logging
 import warnings
@@ -329,6 +329,10 @@ def _get_param_groups(
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
+                continue
+            # UltraEP replica weights are ephemeral mirrors of logical master experts. Their
+            # storage is owned by UltraEP and must not receive optimizer state or updates.
+            if getattr(param, '_ultraep_is_replica', False):
                 continue
 
             uses_default_config = False

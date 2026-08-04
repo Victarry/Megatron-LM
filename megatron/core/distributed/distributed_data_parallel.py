@@ -115,11 +115,16 @@ class DistributedDataParallel(_BaseDataParallel):
             if not param.requires_grad:
                 continue
 
+            param.grad_added_to_main_grad = False
+            # UltraEP replica parameters use its cross-layer shared gradient buffer. They are
+            # trainable so TE produces wgrad, but they must not consume DDP buffer space or
+            # participate in DP collectives.
+            if getattr(param, '_ultraep_is_replica', False):
+                continue
+
             # Track params with grad to enable direct setting
             # of param.grad_added_to_main_grad
             self.params_with_grad.append(param)
-
-            param.grad_added_to_main_grad = False
             param_to_name[param] = name
             all_params.append(param)
 
@@ -336,6 +341,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 for bucket in bucket_group.buckets:
                     for param in bucket.params_list:
                         self.param_to_bucket_group[param] = bucket_group
+                        if getattr(param, '_ultraep_is_master', False):
+                            param._ultraep_ddp_bucket_group = bucket_group
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
@@ -468,6 +475,13 @@ class DistributedDataParallel(_BaseDataParallel):
             if is_graph_capturing():
                 return
 
+            if getattr(param, '_ultraep_is_replica', False):
+                # With gradient-accumulation fusion, TE writes replica wgrad directly into
+                # UltraEP's shared main_grad buffer. Discard the autograd placeholder grad;
+                # replica params intentionally have no DDP bucket.
+                param.grad = None
+                return
+
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
@@ -482,9 +496,14 @@ class DistributedDataParallel(_BaseDataParallel):
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(
-                        param, self.force_all_reduce
-                    )
+                    if getattr(param, '_ultraep_is_master', False):
+                        # UltraEP adds replica wgrad into this master after the expert backward.
+                        # The MoE autograd callback releases it once that reduction is complete.
+                        param._ultraep_force_all_reduce = self.force_all_reduce
+                    else:
+                        self.param_to_bucket_group[param].register_grad_ready(
+                            param, self.force_all_reduce
+                        )
 
         return hook
 

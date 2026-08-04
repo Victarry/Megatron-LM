@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -34,6 +35,11 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
+)
+from megatron.core.transformer.moe.ultraep_manager import (
+    HAVE_ULTRAEP,
+    UltraEPManager,
+    get_or_create_ultraep_manager,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -66,6 +72,46 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
     TELinear, te_checkpoint = None, None
+
+
+class _UltraEPReplicaGradReduce(torch.autograd.Function):
+    """Reduce replica gradients after the expert backward pass.
+
+    Wrapping the dispatched expert input places this callback after expert and dispatcher
+    backward. The first integration deliberately waits for UltraEP reduction here before
+    releasing deferred DDP master gradients; this keeps microbatch ordering correct for PP/VPP.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, moe_layer, virtual_layer_id):
+        """Save the UltraEP layer context while forwarding expert inputs unchanged."""
+        ctx.moe_layer = moe_layer
+        ctx.virtual_layer_id = virtual_layer_id
+        return hidden_states
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Reduce replica gradients before releasing master gradients to DDP."""
+        ctx.moe_layer._ultraep_reduce_replica_grads(ctx.virtual_layer_id)
+        ctx.moe_layer._ultraep_register_master_grads_ready()
+        return grad_output, None, None
+
+
+class _UltraEPRestoreReplicaWeights(torch.autograd.Function):
+    """Restore a microbatch's replica weights before expert dgrad is evaluated."""
+
+    @staticmethod
+    def forward(ctx, output, moe_layer, virtual_layer_id):
+        """Save the UltraEP layer context while forwarding expert outputs unchanged."""
+        ctx.moe_layer = moe_layer
+        ctx.virtual_layer_id = virtual_layer_id
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Restore replica weights before evaluating the expert input gradients."""
+        ctx.moe_layer.ultraep_manager.weight_sync(ctx.virtual_layer_id, async_finish=False)
+        return grad_output, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -257,6 +303,26 @@ class MoELayer(BaseMoELayer):
             and "shared_experts" in config.recompute_modules
         )
 
+        self.num_local_master_experts = self.num_local_experts
+        self.local_master_expert_indices = self.local_expert_indices
+        self.ultraep_enabled = config.moe_enable_ultraep
+        self.ultraep_manager: UltraEPManager | None = None
+        if self.ultraep_enabled:
+            if not HAVE_ULTRAEP:
+                raise ImportError(
+                    "moe_enable_ultraep=True requires UltraEP to be installed in the container."
+                )
+            if layer_number is None:
+                raise ValueError("UltraEP MoE layers require a stable layer_number.")
+            self.ultraep_manager = get_or_create_ultraep_manager(config, self.ep_group)
+            self.num_local_physical_experts = self.ultraep_manager.num_local_physical_experts
+            self.num_global_physical_experts = self.ultraep_manager.num_global_physical_experts
+            self.local_physical_expert_indices = self.ultraep_manager.local_physical_expert_indices
+        else:
+            self.num_local_physical_experts = self.num_local_master_experts
+            self.num_global_physical_experts = self.config.num_moe_experts
+            self.local_physical_expert_indices = self.local_master_expert_indices
+
         self.tp_group = pg_collection.tp
         self.tp_ep_group = pg_collection.tp_ep
 
@@ -313,17 +379,19 @@ class MoELayer(BaseMoELayer):
             )
         elif config.moe_token_dispatcher_type == "alltoall":
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
+                self.num_local_physical_experts,
+                self.local_physical_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
+                num_global_experts=self.num_global_physical_experts,
             )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
+                self.num_local_physical_experts,
+                self.local_physical_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
+                num_global_experts=self.num_global_physical_experts,
             )
         else:
             raise ValueError(
@@ -332,11 +400,18 @@ class MoELayer(BaseMoELayer):
 
         # Initialize experts
         self.experts = self.submodules.experts(
-            self.num_local_experts,
+            self.num_local_physical_experts,
             self.config,
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        self._ultraep_master_ptrs_registered = not self.ultraep_enabled
+        if self.ultraep_enabled:
+            if not isinstance(self.experts, TEGroupedMLP):
+                raise TypeError(
+                    f"UltraEP requires TEGroupedMLP experts, got {type(self.experts).__name__}."
+                )
+            self._ultraep_register_replica_parameters()
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -394,6 +469,105 @@ class MoELayer(BaseMoELayer):
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
+
+    def _ultraep_register_replica_parameters(self) -> None:
+        """Map replica expert parameters onto UltraEP's cross-layer shared buffers."""
+        manager = not_none(self.ultraep_manager)
+        num_masters = manager.num_local_master_experts
+        num_physical = manager.num_local_physical_experts
+        replica_weight_buffers = (
+            manager.local_replica_fc1_weight_buffer,
+            manager.local_replica_fc2_weight_buffer,
+        )
+        replica_grad_buffers = (
+            manager.local_replica_fc1_grad_buffer,
+            manager.local_replica_fc2_grad_buffer,
+        )
+        expected_numels = (manager.expert_fc1_numel, manager.expert_fc2_numel)
+
+        for linear, weight_buffer, grad_buffer, expected_numel in zip(
+            (self.experts.linear_fc1, self.experts.linear_fc2),
+            replica_weight_buffers,
+            replica_grad_buffers,
+            expected_numels,
+        ):
+            first_weight = getattr(linear, "weight0", None)
+            if first_weight is None:
+                raise TypeError("UltraEP requires per-expert TE GroupedLinear weight parameters.")
+            if first_weight.numel() != expected_numel:
+                raise ValueError(
+                    f"UltraEP expert weight size mismatch: expected {expected_numel}, "
+                    f"got {first_weight.numel()}."
+                )
+
+            for expert_index in range(num_masters):
+                master_weight = getattr(linear, f"weight{expert_index}", None)
+                if master_weight is None:
+                    raise AttributeError(f"Missing master expert weight{expert_index} in {linear}.")
+                master_weight._ultraep_is_master = True
+
+            for expert_index in range(num_masters, num_physical):
+                replica_weight = getattr(linear, f"weight{expert_index}", None)
+                if replica_weight is None:
+                    raise AttributeError(
+                        f"Missing replica expert weight{expert_index} in {linear}."
+                    )
+                replica_offset = expert_index - num_masters
+                replica_weight._ultraep_is_replica = True
+                replica_weight.data = weight_buffer[replica_offset].view(first_weight.shape)
+                replica_weight.main_grad = grad_buffer[replica_offset].view(first_weight.shape)
+
+        # Checkpoint logic uses the logical count and omits the ephemeral replica parameters.
+        self.experts.num_local_master_experts = num_masters
+        self._ultraep_master_ptrs_registered = False
+
+    def _ultraep_register_master_experts(self) -> None:
+        """Register master parameter pointers after DDP has finalized its buffers."""
+        if self._ultraep_master_ptrs_registered:
+            return
+
+        manager = not_none(self.ultraep_manager)
+        master_weights = ([], [])
+        master_grads = ([], [])
+        for module_index, linear in enumerate((self.experts.linear_fc1, self.experts.linear_fc2)):
+            for expert_index in range(manager.num_local_master_experts):
+                weight = getattr(linear, f"weight{expert_index}")
+                if not hasattr(weight, "main_grad"):
+                    raise RuntimeError(
+                        "UltraEP master expert registration must run after MCore DDP"
+                        " initialization."
+                    )
+                if weight.main_grad.dtype != torch.float32:
+                    raise TypeError(
+                        "UltraEP requires FP32 main gradients; enable grad_reduce_in_fp32."
+                    )
+                master_weights[module_index].append(weight.data)
+                master_grads[module_index].append(weight.main_grad)
+
+        manager.register_master_experts(
+            not_none(self.layer_number),
+            master_weights[0],
+            master_weights[1],
+            master_grads[0],
+            master_grads[1],
+        )
+        self._ultraep_master_ptrs_registered = True
+
+    def _ultraep_reduce_replica_grads(self, virtual_layer_id: int) -> None:
+        """Synchronously merge replica gradients into master gradients."""
+        not_none(self.ultraep_manager).grad_reduce(virtual_layer_id, async_finish=False)
+
+    def _ultraep_register_master_grads_ready(self) -> None:
+        """Release deferred master expert parameters to overlapping DDP reduction."""
+        for param in self.experts.parameters():
+            if not getattr(param, "_ultraep_is_master", False):
+                continue
+            bucket_group = getattr(param, "_ultraep_ddp_bucket_group", None)
+            if bucket_group is None or not bucket_group.ddp_config.overlap_grad_reduce:
+                continue
+            bucket_group.register_grad_ready(
+                param, getattr(param, "_ultraep_force_all_reduce", False)
+            )
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.
@@ -696,6 +870,15 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        virtual_layer_id = None
+        if self.ultraep_enabled:
+            if intermediate_tensors is not None:
+                raise RuntimeError("UltraEP requires the unsplit MoE forward path.")
+            self._ultraep_register_master_experts()
+            virtual_layer_id = not_none(self.ultraep_manager).allocate_microbatch_slot(
+                not_none(self.layer_number)
+            )
+
         # Select the active token dispatcher based on whether the inference engine
         # is currently using the model. Only applies when the inference dispatcher
         # was set up (config.transformer_impl == "inference_optimized").
@@ -747,7 +930,20 @@ class MoELayer(BaseMoELayer):
                     probs, routing_map = self.route(
                         hidden_states, padding_mask, input_ids, packed_seq_params
                     )
+                    weight_sync_event = None
+                    if self.ultraep_enabled:
+                        manager = not_none(self.ultraep_manager)
+                        manager.update_placement(not_none(virtual_layer_id), routing_map)
+                        weight_sync_event = manager.weight_sync(
+                            not_none(virtual_layer_id), async_finish=True
+                        )
+                        probs, routing_map = manager.reroute(
+                            not_none(virtual_layer_id), probs, routing_map
+                        )
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+
+                    if weight_sync_event is not None:
+                        weight_sync_event.current_stream_wait()
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
@@ -764,12 +960,21 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
+                if self.ultraep_enabled:
+                    hidden_states = _UltraEPReplicaGradReduce.apply(
+                        hidden_states, self, not_none(virtual_layer_id)
+                    )
+
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
+                if self.ultraep_enabled:
+                    output = _UltraEPRestoreReplicaWeights.apply(
+                        output, self, not_none(virtual_layer_id)
+                    )
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
